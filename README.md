@@ -74,11 +74,8 @@ Contributions are welcome! Please open an issue or submit a pull request for any
 
 For any questions or issues, please open an issue on this repository.
 
-```
-
 ### Additional Notes:
 
 - Make sure to keep your API key secure and do not expose it publicly.
 - Adjust the sleep interval (`time.sleep(0.2)`) as needed to avoid hitting the API rate limit.
 - Ensure you have the necessary permissions to use the Etherscan API and comply with their usage policies.
-```
