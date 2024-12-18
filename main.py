@@ -23,7 +23,11 @@ semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
 
 def wei_to_eth(value: str) -> float:
     """Convert Wei to ETH."""
-    return int(value) / 10**18
+    try:
+        return int(value) / 10**18
+    except ValueError:
+        logger.error(f"Invalid Wei value: {value}")
+        return 0.0
 
 async def fetch_transactions(session: ClientSession, address: str) -> Optional[List[Dict]]:
     """Fetch Ethereum transactions for a specific address."""
