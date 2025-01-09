@@ -29,35 +29,45 @@ def wei_to_eth(value: str) -> float:
         logger.error(f"Invalid Wei value: {value}")
         return 0.0
 
+async def fetch_with_retries(
+    session: ClientSession, url: str, max_retries: int = MAX_RETRIES
+) -> Optional[Dict]:
+    """Fetch data from a URL with retries and exponential backoff."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            async with semaphore, session.get(url) as response:
+                if response.status != 200:
+                    logger.warning(f"Attempt {attempt}: Unexpected response {response.status} for URL: {url}")
+                    continue
+                data = await response.json()
+                return data
+        except aiohttp.ClientError as e:
+            logger.warning(f"Attempt {attempt}: Client error for URL {url}: {e}")
+        except asyncio.TimeoutError:
+            logger.warning(f"Attempt {attempt}: Timeout for URL {url}")
+        
+        await asyncio.sleep(2 ** attempt)  # Exponential backoff
+
+    logger.error(f"Failed to fetch data from URL {url} after {max_retries} attempts.")
+    return None
+
 async def fetch_transactions(session: ClientSession, address: str) -> Optional[List[Dict]]:
     """Fetch Ethereum transactions for a specific address."""
     url = f'{BASE_URL}?module=account&action=txlist&address={address}&startblock=0&endblock=99999999&sort=asc&apikey={API_KEY}'
     logger.info(f'Fetching transactions for address: {address}')
     
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            async with semaphore, session.get(url) as response:
-                if response.status != 200:
-                    logger.warning(f"Unexpected response code {response.status} for {address}")
-                    continue
-                data = await response.json()
-                if data.get('status') == '1':
-                    return data.get('result', [])
-                elif data.get('message') == 'No transactions found':
-                    logger.info(f'No transactions found for address: {address}')
-                    return []
-                else:
-                    logger.error(f'API error for {address}: {data}')
-                    return None
-        except (aiohttp.ClientError, aiohttp.ClientResponseError) as e:
-            logger.warning(f'Attempt {attempt}/{MAX_RETRIES} failed for {address}: {e}')
-            await asyncio.sleep(2 ** attempt)  # Exponential backoff
-        except Exception as e:
-            logger.error(f'Unexpected error while fetching transactions for {address}: {e}')
-            break
-    
-    logger.error(f'Failed to fetch transactions for {address} after {MAX_RETRIES} retries.')
-    return None
+    data = await fetch_with_retries(session, url)
+    if data is None:
+        return None
+
+    if data.get('status') == '1':
+        return data.get('result', [])
+    elif data.get('message') == 'No transactions found':
+        logger.info(f'No transactions found for address: {address}')
+        return []
+    else:
+        logger.error(f"API error for {address}: {data}")
+        return None
 
 async def process_address(
     session: ClientSession, address: str, processed_addresses: Set[str], depth: int
@@ -72,7 +82,7 @@ async def process_address(
     transactions = await fetch_transactions(session, address)
     if transactions is None:
         return []
-    
+
     return await process_transactions(session, transactions, processed_addresses, depth - 1)
 
 async def process_transactions(
@@ -96,7 +106,7 @@ async def process_transactions(
             if to_address and to_address not in processed_addresses:
                 tasks.append(process_address(session, to_address, processed_addresses, depth))
     
-    # Handle recursive results
+    # Gather results from recursive tasks
     results = await asyncio.gather(*tasks, return_exceptions=True)
     for result in results:
         if isinstance(result, list):
