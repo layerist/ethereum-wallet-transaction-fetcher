@@ -1,9 +1,10 @@
 import asyncio
 import aiohttp
+import aiofiles
 import json
 import logging
 from aiohttp import ClientSession
-from typing import List, Set, Tuple, Optional, Dict
+from typing import List, Set, Tuple, Dict, Optional
 
 # Configuration
 API_KEY = 'Your_Etherscan_API_Key_Here'
@@ -15,7 +16,7 @@ CONCURRENT_REQUESTS = 10
 OUTPUT_FILE = 'transactions.json'
 
 # Logging setup
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 # Semaphore to limit concurrent requests
@@ -23,7 +24,7 @@ semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
 
 
 def wei_to_eth(value: str) -> float:
-    """Convert Wei to ETH, handling errors gracefully."""
+    """Convert Wei to ETH safely."""
     try:
         return int(value) / 10**18
     except (ValueError, TypeError):
@@ -31,9 +32,9 @@ def wei_to_eth(value: str) -> float:
         return 0.0
 
 
-async def fetch_with_retries(session: ClientSession, url: str, max_retries: int = MAX_RETRIES) -> Optional[Dict]:
+async def fetch_with_retries(session: ClientSession, url: str) -> Optional[Dict]:
     """Fetch data with retries and exponential backoff."""
-    for attempt in range(max_retries):
+    for attempt in range(1, MAX_RETRIES + 1):
         try:
             async with semaphore, session.get(url, timeout=10) as response:
                 if response.status == 200:
@@ -42,13 +43,13 @@ async def fetch_with_retries(session: ClientSession, url: str, max_retries: int 
                         return data
                     logger.warning(f"API responded with status {data.get('status')}: {data.get('message')}")
                 else:
-                    logger.warning(f"Attempt {attempt + 1}: HTTP {response.status} - {url}")
+                    logger.warning(f"Attempt {attempt}: HTTP {response.status} - {url}")
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            logger.warning(f"Attempt {attempt + 1}: Error fetching {url} - {e}")
+            logger.warning(f"Attempt {attempt}: Error fetching {url} - {e}")
 
-        await asyncio.sleep(2 ** attempt)  # Exponential backoff
+        await asyncio.sleep(2**attempt)  # Exponential backoff
 
-    logger.error(f"Failed to fetch data from {url} after {max_retries} attempts.")
+    logger.error(f"Failed to fetch data from {url} after {MAX_RETRIES} attempts.")
     return None
 
 
@@ -61,30 +62,37 @@ async def fetch_transactions(session: ClientSession, address: str) -> List[Dict]
     return data.get("result", []) if data else []
 
 
-async def process_transactions(
-    session: ClientSession, transactions: List[Dict], processed_addresses: Set[str], depth: int
-) -> List[Tuple[str, str, float]]:
-    """Process transactions and explore new addresses up to the given depth."""
-    if depth == 0:
+async def process_address(session: ClientSession, address: str, processed_addresses: Set[str], depth: int) -> List[Tuple[str, str, float]]:
+    """Recursively fetch and process transactions up to the given depth."""
+    if address in processed_addresses or depth == 0:
         return []
+    
+    processed_addresses.add(address)
+    logger.info(f"Processing {address} at depth {depth}")
 
+    transactions = await fetch_transactions(session, address)
+    return await process_transactions(session, transactions, processed_addresses, depth - 1)
+
+
+async def process_transactions(session: ClientSession, transactions: List[Dict], processed_addresses: Set[str], depth: int) -> List[Tuple[str, str, float]]:
+    """Process transactions and explore new addresses up to the given depth."""
     links = []
-    new_tasks = []
+    tasks = []
 
     for tx in transactions:
         from_addr, to_addr, value = tx.get("from"), tx.get("to"), wei_to_eth(tx.get("value", "0"))
         if from_addr and to_addr:
             links.append((from_addr, to_addr, value))
 
-            # Avoid reprocessing known addresses
-            if depth > 0:
-                if from_addr not in processed_addresses:
-                    new_tasks.append(process_address(session, from_addr, processed_addresses, depth - 1))
-                if to_addr not in processed_addresses:
-                    new_tasks.append(process_address(session, to_addr, processed_addresses, depth - 1))
+            # Queue new addresses for processing if not seen before
+            if from_addr not in processed_addresses:
+                tasks.append(process_address(session, from_addr, processed_addresses, depth))
+            if to_addr not in processed_addresses:
+                tasks.append(process_address(session, to_addr, processed_addresses, depth))
 
     # Process new addresses concurrently
-    results = await asyncio.gather(*new_tasks, return_exceptions=True)
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
     for result in results:
         if isinstance(result, list):
             links.extend(result)
@@ -94,20 +102,8 @@ async def process_transactions(
     return links
 
 
-async def process_address(session: ClientSession, address: str, processed_addresses: Set[str], depth: int) -> List[Tuple[str, str, float]]:
-    """Recursively fetch and process transactions up to the given depth."""
-    if address in processed_addresses:
-        return []
-    
-    processed_addresses.add(address)
-    logger.info(f"Processing {address} at depth {depth}")
-
-    transactions = await fetch_transactions(session, address)
-    return await process_transactions(session, transactions, processed_addresses, depth)
-
-
 async def save_results_to_file(data: List[Tuple[str, str, float]], file_path: str) -> None:
-    """Save the transaction data asynchronously to a JSON file."""
+    """Save transaction data asynchronously to a JSON file."""
     try:
         async with aiofiles.open(file_path, "w") as f:
             await f.write(json.dumps(data, indent=4))
