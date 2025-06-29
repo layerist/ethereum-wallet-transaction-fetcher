@@ -4,16 +4,16 @@ import aiofiles
 import json
 import logging
 from aiohttp import ClientSession
-from typing import List, Set, Tuple, Dict, Optional
+from typing import List, Set, Dict, Optional
 
 # === Configuration ===
-API_KEY = 'Your_Etherscan_API_Key_Here'
-BASE_URL = 'https://api.etherscan.io/api'
-START_ADDRESS = 'Your_Ethereum_Wallet_Address_Here'
+API_KEY = "Your_Etherscan_API_Key_Here"
+BASE_URL = "https://api.etherscan.io/api"
+START_ADDRESS = "Your_Ethereum_Wallet_Address_Here"
 DEPTH = 2
 MAX_RETRIES = 3
 CONCURRENT_REQUESTS = 10
-OUTPUT_FILE = 'transactions.json'
+OUTPUT_FILE = "transactions.json"
 
 # === Logging Setup ===
 logging.basicConfig(
@@ -26,7 +26,7 @@ semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
 
 
 def wei_to_eth(wei: str) -> float:
-    """Convert Wei to Ether."""
+    """Converts a string Wei value to Ether."""
     try:
         return int(wei) / 1e18
     except (ValueError, TypeError):
@@ -35,33 +35,38 @@ def wei_to_eth(wei: str) -> float:
 
 
 async def fetch_with_retries(session: ClientSession, url: str) -> Optional[Dict]:
-    """Perform a GET request with retries and exponential backoff."""
+    """
+    Executes a GET request with retry logic and exponential backoff.
+    Returns the JSON-decoded data on success, or None on failure.
+    """
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             async with semaphore:
-                async with session.get(url, timeout=10) as response:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
                     if response.status == 200:
                         data = await response.json()
                         if data.get("status") == "1":
                             return data
-                        logger.warning(f"Etherscan API error: {data.get('message')}")
+                        logger.warning(f"Etherscan API returned error: {data.get('message')}")
                     else:
-                        logger.warning(f"HTTP {response.status} on attempt {attempt}: {url}")
+                        logger.warning(f"HTTP {response.status} on attempt {attempt} for {url}")
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            logger.warning(f"Request error (attempt {attempt}): {e}")
+            logger.warning(f"Request failed (attempt {attempt}): {e}")
         await asyncio.sleep(2 ** attempt)
-    logger.error(f"Failed to fetch after {MAX_RETRIES} attempts: {url}")
+    logger.error(f"Failed to fetch data after {MAX_RETRIES} attempts: {url}")
     return None
 
 
 async def fetch_transactions(session: ClientSession, address: str) -> List[Dict]:
-    """Fetch Ethereum transactions for a given address."""
+    """
+    Fetches all transactions for a given Ethereum address.
+    """
     url = (
         f"{BASE_URL}?module=account&action=txlist"
         f"&address={address}&startblock=0&endblock=99999999"
         f"&sort=asc&apikey={API_KEY}"
     )
-    logger.debug(f"Fetching transactions for: {address}")
+    logger.debug(f"Fetching transactions for {address}")
     data = await fetch_with_retries(session, url)
     return data.get("result", []) if data else []
 
@@ -71,8 +76,11 @@ async def process_address(
     address: str,
     processed: Set[str],
     depth: int
-) -> List[Dict[str, object]]:
-    """Process an address and return its transaction edges."""
+) -> List[Dict]:
+    """
+    Recursively processes an address, fetching its transactions
+    and discovering linked addresses up to a specified depth.
+    """
     if depth <= 0 or address in processed:
         return []
 
@@ -88,9 +96,12 @@ async def process_transactions(
     transactions: List[Dict],
     processed: Set[str],
     depth: int
-) -> List[Dict[str, object]]:
-    """Process and link addresses found in transactions."""
-    edges: List[Dict[str, object]] = []
+) -> List[Dict]:
+    """
+    Processes a list of transactions and recursively explores
+    related addresses.
+    """
+    edges: List[Dict] = []
     next_addresses: Set[str] = set()
 
     for tx in transactions:
@@ -104,7 +115,7 @@ async def process_transactions(
                 "to": to_addr,
                 "value": value_eth,
                 "hash": tx.get("hash"),
-                "timestamp": tx.get("timeStamp")
+                "timestamp": tx.get("timeStamp"),
             })
             if from_addr not in processed:
                 next_addresses.add(from_addr)
@@ -121,40 +132,49 @@ async def process_transactions(
         if isinstance(result, list):
             edges.extend(result)
         else:
-            logger.error(f"Error in recursive call: {result}")
+            logger.error(f"Error during recursive processing: {result}")
 
     return edges
 
 
-async def save_to_file(data: List[Dict[str, object]], filename: str) -> None:
-    """Save results to a JSON file."""
+async def save_to_file(data: List[Dict], filename: str) -> None:
+    """
+    Saves the given data to a JSON file.
+    """
     try:
         async with aiofiles.open(filename, "w") as f:
             await f.write(json.dumps(data, indent=4))
-        logger.info(f"Saved {len(data)} records to '{filename}'")
+        logger.info(f"Saved {len(data)} records to {filename}")
     except Exception as e:
-        logger.error(f"File save error: {e}")
+        logger.error(f"Error saving to file: {e}")
 
 
 async def main() -> None:
-    """Main execution coroutine."""
-    logger.info(f"Starting crawl from: {START_ADDRESS}")
+    """
+    Entry point for the async crawler.
+    """
+    logger.info(f"Starting Ethereum transaction crawl from: {START_ADDRESS}")
     processed: Set[str] = set()
 
-    async with ClientSession() as session:
-        initial_tx = await fetch_transactions(session, START_ADDRESS)
-        if not initial_tx:
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "etherscan-crawler/1.0"
+    }
+
+    async with ClientSession(headers=headers) as session:
+        initial_transactions = await fetch_transactions(session, START_ADDRESS)
+        if not initial_transactions:
             logger.error("No transactions found for the starting address.")
             return
 
-        all_links = await process_transactions(session, initial_tx, processed, DEPTH)
+        all_links = await process_transactions(session, initial_transactions, processed, DEPTH)
         await save_to_file(all_links, OUTPUT_FILE)
 
-        logger.info(f"Completed. Processed {len(processed)} addresses.")
+        logger.info(f"Completed. Processed {len(processed)} unique addresses.")
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Execution interrupted.")
+        logger.info("Execution interrupted by user.")
