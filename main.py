@@ -8,13 +8,14 @@ from typing import List, Set, Dict, Optional, Union
 from web3 import Web3
 
 # === Configuration ===
-API_KEY = "Your_Etherscan_API_Key_Here"
-BASE_URL = "https://api.etherscan.io/api"
-START_ADDRESS = "Your_Ethereum_Wallet_Address_Here"
-DEPTH = 2
-MAX_RETRIES = 3
-CONCURRENT_REQUESTS = 10
-OUTPUT_FILE = "transactions.json"
+API_KEY: str = "Your_Etherscan_API_Key_Here"
+BASE_URL: str = "https://api.etherscan.io/api"
+START_ADDRESS: str = "Your_Ethereum_Wallet_Address_Here"
+DEPTH: int = 2
+MAX_RETRIES: int = 3
+CONCURRENT_REQUESTS: int = 10
+OUTPUT_FILE: str = "transactions.json"
+REQUEST_TIMEOUT: int = 10
 
 # === Logging Setup ===
 logging.basicConfig(
@@ -27,7 +28,7 @@ semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
 
 
 def wei_to_eth(wei: Union[str, int]) -> float:
-    """Convert Wei to Ether."""
+    """Convert Wei to Ether safely."""
     try:
         return int(wei) / 1e18
     except (ValueError, TypeError):
@@ -46,25 +47,29 @@ async def fetch_with_retries(session: ClientSession, url: str) -> Optional[Dict]
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             async with semaphore:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as resp:
                     if resp.status == 200:
-                        data = await resp.json()
-                        # Etherscan returns status "0" for empty results too
-                        if data.get("status") in ("0", "1"):
+                        data = await resp.json(content_type=None)  # content_type=None → handle bad headers
+                        if isinstance(data, dict) and data.get("status") in ("0", "1"):
                             return data
-                        logger.warning(f"Etherscan API returned unexpected data: {data}")
+                        logger.warning(f"Unexpected Etherscan response: {data}")
                     else:
                         logger.warning(f"HTTP {resp.status} on attempt {attempt} for {url}")
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             logger.warning(f"Attempt {attempt} failed: {e}")
-        await asyncio.sleep(2 ** attempt)
+        await asyncio.sleep(2 ** attempt)  # exponential backoff
     logger.error(f"All retries failed for {url}")
     return None
 
 
 async def fetch_transactions(session: ClientSession, address: str) -> List[Dict]:
     """Fetch transactions for a specific Ethereum address."""
-    checksum_address = Web3.toChecksumAddress(address)
+    try:
+        checksum_address = Web3.toChecksumAddress(address)
+    except Exception as e:
+        logger.error(f"Invalid address {address}: {e}")
+        return []
+
     url = etherscan_url(
         "account", "txlist",
         address=checksum_address,
@@ -84,7 +89,12 @@ async def process_address(
     depth: int
 ) -> List[Dict]:
     """Process an address and recursively process related addresses."""
-    checksum_address = Web3.toChecksumAddress(address)
+    try:
+        checksum_address = Web3.toChecksumAddress(address)
+    except Exception as e:
+        logger.error(f"Invalid address {address}: {e}")
+        return []
+
     if depth <= 0 or checksum_address in visited:
         return []
 
@@ -130,19 +140,19 @@ async def process_transactions(
         if to_addr not in visited:
             next_addresses.add(to_addr)
 
-    # Concurrency limited by semaphore
-    tasks = [process_address(session, addr, visited, depth) for addr in next_addresses]
-    for coro in asyncio.as_completed(tasks):
-        try:
-            results.extend(await coro)
-        except Exception as e:
-            logger.error(f"Error in recursive processing: {e}")
+    if depth > 0 and next_addresses:
+        tasks = [process_address(session, addr, visited, depth) for addr in next_addresses]
+        for coro in asyncio.as_completed(tasks):
+            try:
+                results.extend(await coro)
+            except Exception as e:
+                logger.error(f"Error in recursive processing: {e}")
 
     return results
 
 
 async def save_to_file(data: List[Dict], filename: str) -> None:
-    """Save data to a JSON file."""
+    """Save data to a JSON file asynchronously."""
     try:
         async with aiofiles.open(filename, "w") as f:
             await f.write(json.dumps(data, indent=4))
@@ -162,7 +172,7 @@ async def main() -> None:
 
     headers = {
         "Accept": "application/json",
-        "User-Agent": "etherscan-crawler/1.1"
+        "User-Agent": "etherscan-crawler/2.0"
     }
 
     async with ClientSession(headers=headers) as session:
