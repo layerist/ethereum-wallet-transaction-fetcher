@@ -3,15 +3,16 @@ import aiohttp
 import aiofiles
 import json
 import logging
+import os
 from aiohttp import ClientSession
 from typing import List, Set, Dict, Optional, Union
 from web3 import Web3
 
 # === Configuration ===
-API_KEY: str = "Your_Etherscan_API_Key_Here"
+API_KEY: str = os.getenv("ETHERSCAN_API_KEY", "Your_Etherscan_API_Key_Here")
 BASE_URL: str = "https://api.etherscan.io/api"
-START_ADDRESS: str = "Your_Ethereum_Wallet_Address_Here"
-DEPTH: int = 2
+START_ADDRESS: str = os.getenv("START_ADDRESS", "Your_Ethereum_Wallet_Address_Here")
+DEPTH: int = int(os.getenv("CRAWL_DEPTH", 2))
 MAX_RETRIES: int = 3
 CONCURRENT_REQUESTS: int = 10
 OUTPUT_FILE: str = "transactions.json"
@@ -25,6 +26,10 @@ logging.basicConfig(
 logger = logging.getLogger("etherscan-crawler")
 
 semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
+
+# Cache to prevent duplicate queries
+transaction_cache: Dict[str, List[Dict]] = {}
+seen_transactions: Set[str] = set()
 
 
 def wei_to_eth(wei: Union[str, int]) -> float:
@@ -43,32 +48,40 @@ def etherscan_url(module: str, action: str, **params) -> str:
 
 
 async def fetch_with_retries(session: ClientSession, url: str) -> Optional[Dict]:
-    """Fetch JSON data from a URL with retry and exponential backoff."""
+    """Fetch JSON data from a URL with retries and exponential backoff."""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             async with semaphore:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as resp:
                     if resp.status == 200:
-                        data = await resp.json(content_type=None)  # content_type=None → handle bad headers
-                        if isinstance(data, dict) and data.get("status") in ("0", "1"):
+                        try:
+                            data = await resp.json(content_type=None)
+                        except Exception as e:
+                            logger.warning(f"Invalid JSON response: {e}")
+                            data = None
+
+                        if isinstance(data, dict) and "status" in data:
                             return data
                         logger.warning(f"Unexpected Etherscan response: {data}")
                     else:
                         logger.warning(f"HTTP {resp.status} on attempt {attempt} for {url}")
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             logger.warning(f"Attempt {attempt} failed: {e}")
-        await asyncio.sleep(2 ** attempt)  # exponential backoff
+        await asyncio.sleep(2 ** attempt)
     logger.error(f"All retries failed for {url}")
     return None
 
 
 async def fetch_transactions(session: ClientSession, address: str) -> List[Dict]:
-    """Fetch transactions for a specific Ethereum address."""
+    """Fetch transactions for a specific Ethereum address, with caching."""
     try:
         checksum_address = Web3.toChecksumAddress(address)
     except Exception as e:
         logger.error(f"Invalid address {address}: {e}")
         return []
+
+    if checksum_address in transaction_cache:
+        return transaction_cache[checksum_address]
 
     url = etherscan_url(
         "account", "txlist",
@@ -79,7 +92,10 @@ async def fetch_transactions(session: ClientSession, address: str) -> List[Dict]
     )
     logger.debug(f"Fetching transactions for {checksum_address}")
     data = await fetch_with_retries(session, url)
-    return data.get("result", []) if data else []
+
+    txs = data.get("result", []) if data else []
+    transaction_cache[checksum_address] = txs
+    return txs
 
 
 async def process_address(
@@ -114,13 +130,12 @@ async def process_transactions(
     """Process a list of transactions and find new addresses to explore."""
     results: List[Dict] = []
     next_addresses: Set[str] = set()
-    seen_hashes: Set[str] = set()
 
     for tx in transactions:
         tx_hash = tx.get("hash")
-        if not tx_hash or tx_hash in seen_hashes:
+        if not tx_hash or tx_hash in seen_transactions:
             continue
-        seen_hashes.add(tx_hash)
+        seen_transactions.add(tx_hash)
 
         from_addr = tx.get("from")
         to_addr = tx.get("to")
@@ -142,11 +157,12 @@ async def process_transactions(
 
     if depth > 0 and next_addresses:
         tasks = [process_address(session, addr, visited, depth) for addr in next_addresses]
-        for coro in asyncio.as_completed(tasks):
-            try:
-                results.extend(await coro)
-            except Exception as e:
-                logger.error(f"Error in recursive processing: {e}")
+        children_results = await asyncio.gather(*tasks, return_exceptions=True)
+        for res in children_results:
+            if isinstance(res, Exception):
+                logger.error(f"Error in recursive processing: {res}")
+            else:
+                results.extend(res)
 
     return results
 
@@ -172,7 +188,7 @@ async def main() -> None:
 
     headers = {
         "Accept": "application/json",
-        "User-Agent": "etherscan-crawler/2.0"
+        "User-Agent": "etherscan-crawler/2.1"
     }
 
     async with ClientSession(headers=headers) as session:
@@ -185,6 +201,7 @@ async def main() -> None:
         await save_to_file(all_data, OUTPUT_FILE)
 
         logger.info(f"Crawl complete. Unique addresses processed: {len(visited)}")
+        logger.info(f"Total unique transactions collected: {len(seen_transactions)}")
 
 
 if __name__ == "__main__":
@@ -192,3 +209,5 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Interrupted by user. Exiting...")
+    except asyncio.CancelledError:
+        logger.info("Async tasks cancelled. Exiting...")
