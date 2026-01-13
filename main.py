@@ -19,11 +19,12 @@ class Config:
     base_url: str = "https://api.etherscan.io/api"
     start_address: str = os.getenv("START_ADDRESS", "")
     depth: int = int(os.getenv("CRAWL_DEPTH", 2))
-    max_retries: int = 3
-    concurrent_requests: int = 10
-    request_timeout: int = 10
+    max_retries: int = 4
+    concurrent_requests: int = 8
+    request_timeout: int = 12
     output_file: str = "transactions.json"
     resume: bool = True
+    rate_limit_sleep: float = 1.6
 
 
 CFG = Config()
@@ -35,12 +36,12 @@ random.seed(42)
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
 logger = logging.getLogger("etherscan-crawler")
 
 # =============================================================================
-# Globals (minimal & controlled)
+# Globals (controlled)
 # =============================================================================
 
 semaphore = asyncio.Semaphore(CFG.concurrent_requests)
@@ -65,7 +66,7 @@ def wei_to_eth(value: Union[str, int]) -> float:
         return 0.0
 
 
-def build_url(module: str, action: str, **params: str) -> str:
+def build_url(module: str, action: str, **params: Union[str, int]) -> str:
     query = "&".join(f"{k}={v}" for k, v in params.items())
     return (
         f"{CFG.base_url}"
@@ -74,7 +75,8 @@ def build_url(module: str, action: str, **params: str) -> str:
 
 
 async def backoff(attempt: int) -> None:
-    await asyncio.sleep((2 ** attempt) + random.uniform(0, 0.5))
+    delay = min((2 ** attempt) + random.uniform(0, 0.5), 10)
+    await asyncio.sleep(delay)
 
 # =============================================================================
 # HTTP
@@ -82,17 +84,15 @@ async def backoff(attempt: int) -> None:
 
 async def fetch_json(
     session: aiohttp.ClientSession,
-    url: str
+    url: str,
 ) -> Optional[Dict]:
-
     for attempt in range(1, CFG.max_retries + 1):
         try:
             async with semaphore:
                 async with session.get(
                     url,
-                    timeout=aiohttp.ClientTimeout(total=CFG.request_timeout)
+                    timeout=aiohttp.ClientTimeout(total=CFG.request_timeout),
                 ) as r:
-
                     if r.status != 200:
                         logger.warning(f"HTTP {r.status} → {url}")
                         await backoff(attempt)
@@ -101,7 +101,7 @@ async def fetch_json(
                     return await r.json(content_type=None)
 
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            logger.warning(f"Attempt {attempt} failed: {e}")
+            logger.warning(f"Attempt {attempt} failed → {e}")
             await backoff(attempt)
 
     logger.error(f"Failed after retries → {url}")
@@ -110,9 +110,8 @@ async def fetch_json(
 
 async def fetch_transactions(
     session: aiohttp.ClientSession,
-    address: str
+    address: str,
 ) -> List[Dict]:
-
     if address in tx_cache:
         return tx_cache[address]
 
@@ -122,7 +121,7 @@ async def fetch_transactions(
         address=address,
         startblock=0,
         endblock=99999999,
-        sort="asc"
+        sort="asc",
     )
 
     data = await fetch_json(session, url)
@@ -131,12 +130,12 @@ async def fetch_transactions(
         return []
 
     status = data.get("status")
-    message = data.get("message", "").lower()
+    message = str(data.get("message", "")).lower()
 
     if status == "0":
         if "rate limit" in message:
-            logger.warning("Rate limit hit, cooling down…")
-            await asyncio.sleep(1.5)
+            logger.warning("Etherscan rate limit hit → cooling down")
+            await asyncio.sleep(CFG.rate_limit_sleep)
             return []
         if "no transactions" in message:
             tx_cache[address] = []
@@ -147,64 +146,58 @@ async def fetch_transactions(
     return result
 
 # =============================================================================
-# Crawler
+# Crawler (queue-based, bounded)
 # =============================================================================
 
-async def crawl_address(
+async def crawl(
     session: aiohttp.ClientSession,
-    address: str,
-    visited: Set[str],
-    depth: int
+    start_address: str,
+    max_depth: int,
 ) -> List[Dict]:
-
-    if depth <= 0 or address in visited:
-        return []
-
-    visited.add(address)
-    logger.info(f"Crawling {address} | depth={depth}")
-
-    txs = await fetch_transactions(session, address)
-    if not txs:
-        return []
-
+    visited: Set[str] = set()
     results: List[Dict] = []
-    next_addresses: Set[str] = set()
 
-    for tx in txs:
-        tx_hash = tx.get("hash")
-        if not tx_hash or tx_hash in seen_hashes:
+    queue: asyncio.Queue[tuple[str, int]] = asyncio.Queue()
+    await queue.put((start_address, max_depth))
+
+    while not queue.empty():
+        address, depth = await queue.get()
+
+        if depth <= 0 or address in visited:
             continue
 
-        seen_hashes.add(tx_hash)
+        visited.add(address)
+        logger.info(f"Crawling {address} | depth={depth}")
 
-        from_addr = checksum(tx.get("from", ""))
-        to_addr = checksum(tx.get("to", ""))
+        txs = await fetch_transactions(session, address)
+        for tx in txs:
+            tx_hash = tx.get("hash")
+            if not tx_hash or tx_hash in seen_hashes:
+                continue
 
-        if not from_addr or not to_addr:
-            continue
+            from_addr = checksum(tx.get("from", ""))
+            to_addr = checksum(tx.get("to", ""))
 
-        results.append({
-            "hash": tx_hash,
-            "from": from_addr,
-            "to": to_addr,
-            "value_eth": wei_to_eth(tx.get("value", 0)),
-            "timestamp": int(tx.get("timeStamp", 0)),
-        })
+            if not from_addr or not to_addr:
+                continue
 
-        if depth > 1:
-            next_addresses.update({from_addr, to_addr})
+            seen_hashes.add(tx_hash)
 
-    if depth > 1:
-        tasks = [
-            crawl_address(session, addr, visited, depth - 1)
-            for addr in next_addresses
-            if addr not in visited
-        ]
+            results.append({
+                "hash": tx_hash,
+                "from": from_addr,
+                "to": to_addr,
+                "value_eth": wei_to_eth(tx.get("value", 0)),
+                "timestamp": int(tx.get("timeStamp", 0)),
+            })
 
-        for group in await asyncio.gather(*tasks, return_exceptions=True):
-            if isinstance(group, list):
-                results.extend(group)
+            if depth > 1:
+                if from_addr not in visited:
+                    await queue.put((from_addr, depth - 1))
+                if to_addr not in visited:
+                    await queue.put((to_addr, depth - 1))
 
+    logger.info(f"Crawl finished | addresses={len(visited)}")
     return results
 
 # =============================================================================
@@ -227,7 +220,7 @@ async def load_existing(path: str) -> List[Dict]:
         return data
 
     except Exception as e:
-        logger.warning(f"Resume failed: {e}")
+        logger.warning(f"Resume failed → {e}")
         return []
 
 
@@ -251,28 +244,25 @@ async def main() -> None:
         return
 
     existing = await load_existing(CFG.output_file)
-    visited: Set[str] = set()
 
     headers = {
         "Accept": "application/json",
-        "User-Agent": "etherscan-crawler/6.0"
+        "User-Agent": "etherscan-crawler/7.0",
     }
 
     async with aiohttp.ClientSession(headers=headers) as session:
-        new_data = await crawl_address(session, start, visited, CFG.depth)
+        new_data = await crawl(session, start, CFG.depth)
 
     merged = {tx["hash"]: tx for tx in existing}
     for tx in new_data:
         merged[tx["hash"]] = tx
 
-    final = list(merged.values())
-    await save(CFG.output_file, final)
-
-    logger.info(
-        f"Done | Addresses: {len(visited)} | "
-        f"TXs: {len(final)}"
-    )
+    await save(CFG.output_file, list(merged.values()))
+    logger.info(f"Done | TXs total: {len(merged)}")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.warning("Interrupted by user")
