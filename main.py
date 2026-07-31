@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 """
-Reliable Async Etherscan BFS Crawler v14
+Reliable Async Etherscan BFS Crawler v15
 
-Main changes from v13:
+Main changes from v14:
+- Frontier depth is upgraded when an address is rediscovered through a deeper path.
+- Output is flushed before transaction IDs are committed to SQLite, preventing silent data loss.
+- Writer failure is propagated immediately instead of potentially deadlocking workers.
+- Contract-creation transactions are preserved even when the `to` address is empty.
+- Stronger validation, HTTP diagnostics, pagination guards, and shutdown handling.
+- Existing v14 reliability improvements are retained.
+
+Previously inherited changes:
 - Uses Etherscan API V2 by default (chainid is required).
 - Durable SQLite frontier: a restart continues queued/in-progress addresses.
 - A dedicated bounded writer queue provides backpressure and owns all NDJSON writes.
@@ -44,11 +52,11 @@ import re
 import signal
 import sqlite3
 import time
+from email.utils import parsedate_to_datetime
 from dataclasses import asdict, dataclass, field
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterable, Optional
-from urllib.parse import urlencode
 
 import aiofiles
 import aiohttp
@@ -93,7 +101,6 @@ class Config:
     depth: int = env_int("CRAWL_DEPTH", 2)
     workers: int = env_int("CRAWL_WORKERS", 8)
     concurrent_requests: int = env_int("CRAWL_CONCURRENT_REQUESTS", 8)
-    work_queue_size: int = env_int("CRAWL_WORK_QUEUE_SIZE", 20_000)
     writer_queue_size: int = env_int("WRITER_QUEUE_SIZE", 2_000)
 
     rate_limit_per_sec: float = env_float("ETHERSCAN_RATE_LIMIT_PER_SEC", 2.8)
@@ -115,8 +122,6 @@ class Config:
     state_db: Path = Path(
         os.getenv("STATE_DB", "transactions.state.sqlite3").strip()
     )
-    writer_batch_size: int = env_int("WRITER_BATCH_SIZE", 1_000)
-    writer_flush_sec: float = env_float("WRITER_FLUSH_SEC", 2.0)
     fsync_writes: bool = env_bool("FSYNC_WRITES", False)
 
     include_internal_txs: bool = env_bool("INCLUDE_INTERNAL_TXS", False)
@@ -140,12 +145,20 @@ class Config:
             errors.append("rate limit and burst size must be positive")
         if self.max_request_retries < 1 or self.max_address_retries < 0:
             errors.append("retry values are invalid")
+        if self.request_timeout_sec <= 0 or self.connect_timeout_sec <= 0:
+            errors.append("request/connect timeouts must be positive")
+        if self.retry_base_sec <= 0 or self.retry_cap_sec < self.retry_base_sec:
+            errors.append("retry delay values are invalid")
+        if self.writer_queue_size < 1:
+            errors.append("WRITER_QUEUE_SIZE must be >= 1")
+        if self.log_every_sec <= 0:
+            errors.append("LOG_EVERY_SEC must be positive")
+        if not self.base_url.startswith(("https://", "http://")):
+            errors.append("ETHERSCAN_BASE_URL must be an HTTP(S) URL")
         if not (1 <= self.page_size <= 10_000):
             errors.append("ETHERSCAN_PAGE_SIZE must be between 1 and 10000")
         if self.startblock < 0 or self.endblock < self.startblock:
             errors.append("invalid startblock/endblock range")
-        if self.writer_batch_size < 1:
-            errors.append("WRITER_BATCH_SIZE must be >= 1")
         if errors:
             raise RuntimeError("Invalid configuration:\n- " + "\n- ".join(errors))
 
@@ -209,6 +222,7 @@ class Stats:
     tx_observed: int = 0
     tx_written: int = 0
     tx_duplicates: int = 0
+    malformed_transactions: int = 0
 
 
 class FatalAPIError(RuntimeError):
@@ -258,7 +272,10 @@ def transaction_record_id(tx: dict[str, Any], kind: str) -> str:
         if not trace_id:
             trace_id = ":".join(
                 str(tx.get(key, ""))
-                for key in ("blockNumber", "transactionIndex", "from", "to", "value")
+                for key in (
+                    "blockNumber", "transactionIndex", "type", "callType",
+                    "from", "to", "value", "gas", "gasUsed", "input",
+                )
             )
         return f"internal:{tx_hash}:{trace_id}"
     return f"normal:{tx_hash}"
@@ -274,7 +291,11 @@ def parse_retry_after(value: Optional[str]) -> Optional[float]:
     try:
         return max(0.0, float(value))
     except ValueError:
-        return None
+        try:
+            retry_at = parsedate_to_datetime(value)
+            return max(0.0, retry_at.timestamp() - time.time())
+        except (TypeError, ValueError, OverflowError):
+            return None
 
 
 def is_no_transactions(data: dict[str, Any]) -> bool:
@@ -400,14 +421,46 @@ class StateStore:
         )
 
     def enqueue(self, address: str, depth: int) -> bool:
-        cur = self.conn.execute(
-            """
-            INSERT OR IGNORE INTO addresses(address, depth, status, attempts, updated_at)
-            VALUES (?, ?, 'queued', 0, ?)
-            """,
-            (address, depth, int(time.time())),
-        )
-        return cur.rowcount == 1
+        """Insert a new frontier item or upgrade an existing item to a deeper crawl.
+
+        Returns True only when the caller must place the address into the in-memory queue.
+        A completed/failed address is reopened when a deeper path is discovered because the
+        earlier shallower visit could not have expanded all levels now requested.
+        """
+        now = int(time.time())
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.conn.execute(
+                "SELECT depth, status FROM addresses WHERE address=?", (address,)
+            ).fetchone()
+            should_queue = False
+            if row is None:
+                self.conn.execute(
+                    """
+                    INSERT INTO addresses(address, depth, status, attempts, last_error, updated_at)
+                    VALUES (?, ?, 'queued', 0, '', ?)
+                    """,
+                    (address, depth, now),
+                )
+                should_queue = True
+            else:
+                old_depth, status = int(row[0]), str(row[1])
+                if depth > old_depth:
+                    new_status = 'in_progress' if status == 'in_progress' else 'queued'
+                    self.conn.execute(
+                        """
+                        UPDATE addresses
+                        SET depth=?, status=?, attempts=0, last_error='', updated_at=?
+                        WHERE address=?
+                        """,
+                        (depth, new_status, now, address),
+                    )
+                    should_queue = status != 'in_progress'
+            self.conn.execute("COMMIT")
+            return should_queue
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
 
     def queued_items(self) -> list[WorkItem]:
         rows = self.conn.execute(
@@ -520,9 +573,12 @@ class EtherscanClient:
 
                         if response.status in {408, 425, 500, 502, 503, 504}:
                             self.stats.http_errors += 1
-                            await self._sleep_or_stop(
-                                full_jitter_delay(attempt, CFG.retry_base_sec, CFG.retry_cap_sec)
-                            )
+                            delay = parse_retry_after(response.headers.get("Retry-After"))
+                            if delay is None:
+                                delay = full_jitter_delay(
+                                    attempt, CFG.retry_base_sec, CFG.retry_cap_sec
+                                )
+                            await self._sleep_or_stop(delay)
                             continue
 
                         body = await response.text()
@@ -535,6 +591,11 @@ class EtherscanClient:
                                 body[:300],
                             )
                             if 400 <= response.status < 500:
+                                logger.error(
+                                    "Non-retryable HTTP %s for action=%s address=%s: %s",
+                                    response.status, params.get("action"), params.get("address"),
+                                    body[:500],
+                                )
                                 return None
                             await self._sleep_or_stop(
                                 full_jitter_delay(attempt, CFG.retry_base_sec, CFG.retry_cap_sec)
@@ -588,6 +649,7 @@ class EtherscanClient:
     async def fetch_action(self, address: str, action: str) -> FetchOutcome:
         result: list[dict[str, Any]] = []
         page = 1
+        previous_page_signature: tuple[str, str, int] | None = None
         while not self.stop_event.is_set():
             if CFG.max_pages_per_address and page > CFG.max_pages_per_address:
                 return FetchOutcome(
@@ -608,7 +670,24 @@ class EtherscanClient:
                     error=f"unexpected result for {action}: {api_error_text(data)[:300]}",
                 )
 
-            result.extend(row for row in page_rows if isinstance(row, dict))
+            valid_rows = [row for row in page_rows if isinstance(row, dict)]
+            if page_rows and not valid_rows:
+                return FetchOutcome(ok=False, error=f"malformed rows for {action} page {page}")
+
+            if valid_rows:
+                signature = (
+                    str(valid_rows[0].get("hash", "")),
+                    str(valid_rows[-1].get("hash", "")),
+                    len(valid_rows),
+                )
+                if signature == previous_page_signature:
+                    return FetchOutcome(
+                        ok=False,
+                        error=f"repeated page detected for {action} page {page}",
+                    )
+                previous_page_signature = signature
+
+            result.extend(valid_rows)
             if len(page_rows) < CFG.page_size:
                 return FetchOutcome(ok=True, transactions=result)
             page += 1
@@ -674,9 +753,14 @@ async def writer_loop(
                     return
 
                 transactions = request.transactions
-                new_db_ids = store.insert_transaction_ids(tx.record_id for tx in transactions)
-                to_append = [tx for tx in transactions if tx.record_id not in output_ids]
+                unique: dict[str, Transaction] = {}
+                for tx in transactions:
+                    unique.setdefault(tx.record_id, tx)
+                to_append = [tx for tx in unique.values() if tx.record_id not in output_ids]
 
+                # NDJSON is the user-facing durable artifact. Flush it first; only then
+                # record IDs in SQLite. A crash between these two steps can cause a DB
+                # replay, but load_output_ids() prevents duplicate output on restart.
                 if to_append:
                     payload = "".join(
                         json.dumps(asdict(tx), ensure_ascii=False, separators=(",", ":")) + "\n"
@@ -688,11 +772,12 @@ async def writer_loop(
                         await asyncio.to_thread(os.fsync, file.fileno())
                     output_ids.update(tx.record_id for tx in to_append)
 
-                inserted = len(new_db_ids)
-                stats.tx_written += inserted
-                stats.tx_duplicates += len(transactions) - inserted
+                store.insert_transaction_ids(unique)
+                appended = len(to_append)
+                stats.tx_written += appended
+                stats.tx_duplicates += len(transactions) - appended
                 if not request.done.done():
-                    request.done.set_result(inserted)
+                    request.done.set_result(appended)
             except Exception as exc:
                 if request is not None and not request.done.done():
                     request.done.set_exception(exc)
@@ -715,10 +800,19 @@ def parse_transactions(rows: list[dict[str, Any]], stats: Stats) -> tuple[list[T
         if not tx_hash:
             continue
         from_addr = normalize_address(tx.get("from"))
-        to_addr = normalize_address(tx.get("to"))
-        if not from_addr or not to_addr:
+        raw_to = tx.get("to")
+        to_addr = normalize_address(raw_to)
+        contract_address = normalize_address(tx.get("contractAddress"))
+        if not from_addr:
+            stats.malformed_transactions += 1
             continue
-        if CFG.skip_self_transfers and from_addr == to_addr:
+        # Contract-creation transactions legitimately have an empty `to`. Preserve
+        # the record and use the created contract as the graph neighbor when available.
+        output_to = to_addr or contract_address or ""
+        if raw_to not in (None, "") and not to_addr:
+            stats.malformed_transactions += 1
+            continue
+        if CFG.skip_self_transfers and to_addr and from_addr == to_addr:
             continue
 
         kind = str(tx.get("_kind", "normal"))
@@ -728,7 +822,7 @@ def parse_transactions(rows: list[dict[str, Any]], stats: Stats) -> tuple[list[T
                 record_id=transaction_record_id(tx, kind),
                 hash=tx_hash,
                 from_addr=from_addr,
-                to_addr=to_addr,
+                to_addr=output_to,
                 value_wei=value_wei,
                 value_eth=wei_to_eth_str(value_wei),
                 timestamp=safe_int(tx.get("timeStamp")),
@@ -739,7 +833,10 @@ def parse_transactions(rows: list[dict[str, Any]], stats: Stats) -> tuple[list[T
             )
         )
         neighbors.add(from_addr)
-        neighbors.add(to_addr)
+        if to_addr:
+            neighbors.add(to_addr)
+        if contract_address:
+            neighbors.add(contract_address)
 
     stats.tx_observed += len(records)
     return records, neighbors
@@ -822,10 +919,10 @@ async def monitor_loop(
         elapsed = max(0.001, time.monotonic() - stats.started_monotonic)
         logger.info(
             "addr done=%s queued=%s active=%s failed=%s | work_q=%s writer_q=%s | "
-            "tx observed=%s new=%s dup=%s | req=%s http_err=%s soft_err=%s | %.2f tx/s",
+            "tx observed=%s new=%s dup=%s malformed=%s | req=%s http_err=%s soft_err=%s | %.2f tx/s",
             counts["done"], counts["queued"], counts["in_progress"], counts["failed"],
             work_queue.qsize(), writer_queue.qsize(), stats.tx_observed,
-            stats.tx_written, stats.tx_duplicates, stats.requests,
+            stats.tx_written, stats.tx_duplicates, stats.malformed_transactions, stats.requests,
             stats.http_errors, stats.soft_errors, stats.tx_observed / elapsed,
         )
 
@@ -900,7 +997,7 @@ async def run() -> int:
         )
         headers = {
             "Accept": "application/json",
-            "User-Agent": "etherscan-bfs-crawler/14.0",
+            "User-Agent": "etherscan-bfs-crawler/15.0",
         }
         limiter = TokenBucket(CFG.rate_limit_per_sec, CFG.burst_size)
         semaphore = asyncio.Semaphore(CFG.concurrent_requests)
@@ -935,10 +1032,19 @@ async def run() -> int:
             join_task = asyncio.create_task(work_queue.join(), name="work-join")
             stop_task = asyncio.create_task(stop_event.wait(), name="stop-wait")
             done, pending = await asyncio.wait(
-                {join_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
+                {join_task, stop_task, writer_task}, return_when=asyncio.FIRST_COMPLETED
             )
 
-            if join_task in done:
+            if writer_task in done:
+                exc = writer_task.exception()
+                if exc is not None:
+                    logger.error("Writer task failed: %r", exc)
+                    fatal_event.set()
+                    stop_event.set()
+                else:
+                    fatal_event.set()
+                    stop_event.set()
+            elif join_task in done:
                 stop_event.set()
 
             # Workers may be blocked in queue.get() after a normal drain, or may still be
@@ -949,9 +1055,12 @@ async def run() -> int:
             await asyncio.gather(*workers, return_exceptions=True)
 
             # Persist all requests already accepted by the writer before stopping it.
-            await writer_queue.join()
-            await writer_queue.put(None)
-            await writer_task
+            if not writer_task.done():
+                await writer_queue.join()
+                await writer_queue.put(None)
+                await writer_task
+            else:
+                await asyncio.gather(writer_task, return_exceptions=True)
 
             monitor_task.cancel()
             await asyncio.gather(monitor_task, return_exceptions=True)
@@ -963,9 +1072,10 @@ async def run() -> int:
         elapsed = max(0.001, time.monotonic() - stats.started_monotonic)
         logger.info(
             "Done | complete=%s queued=%s active=%s failed=%s | tx_new=%s dup=%s | "
-            "requests=%s | elapsed=%.1fs",
+            "malformed=%s | requests=%s | elapsed=%.1fs",
             counts["done"], counts["queued"], counts["in_progress"], counts["failed"],
-            stats.tx_written, stats.tx_duplicates, stats.requests, elapsed,
+            stats.tx_written, stats.tx_duplicates, stats.malformed_transactions,
+            stats.requests, elapsed,
         )
         return 2 if fatal_event.is_set() else 0
     finally:
