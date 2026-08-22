@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-Reliable Async Etherscan BFS Crawler v15
+Reliable Async Etherscan BFS Crawler v16
 
-Main changes from v14:
-- Frontier depth is upgraded when an address is rediscovered through a deeper path.
-- Output is flushed before transaction IDs are committed to SQLite, preventing silent data loss.
-- Writer failure is propagated immediately instead of potentially deadlocking workers.
-- Contract-creation transactions are preserved even when the `to` address is empty.
-- Stronger validation, HTTP diagnostics, pagination guards, and shutdown handling.
-- Existing v14 reliability improvements are retained.
+Main changes from v15:
+- Fixes a frontier race: a deeper path discovered while an address is in progress is never lost.
+- Workers atomically claim the latest durable depth instead of trusting stale queue items.
+- Completion atomically requeues an address when its depth was upgraded during processing.
+- Address retry logic also uses the latest durable depth.
+- Pagination loop detection uses stronger transaction identities, reducing false positives.
+- Malformed transactions with missing hashes are now counted in diagnostics.
+- Output/state path collision is rejected at startup.
+- Existing v15 durability, retry, shutdown, and writer guarantees are retained.
 
 Previously inherited changes:
 - Uses Etherscan API V2 by default (chainid is required).
@@ -159,6 +161,13 @@ class Config:
             errors.append("ETHERSCAN_PAGE_SIZE must be between 1 and 10000")
         if self.startblock < 0 or self.endblock < self.startblock:
             errors.append("invalid startblock/endblock range")
+        try:
+            if self.output_file.resolve() == self.state_db.resolve():
+                errors.append("OUTPUT_FILE and STATE_DB must be different files")
+        except OSError:
+            # Parent paths may not exist yet; normal file creation will surface any
+            # remaining filesystem problem later.
+            pass
         if errors:
             raise RuntimeError("Invalid configuration:\n- " + "\n- ".join(errors))
 
@@ -455,7 +464,10 @@ class StateStore:
                         """,
                         (depth, new_status, now, address),
                     )
-                    should_queue = status != 'in_progress'
+                    # A queued address already has a wake-up item in memory. Adding
+                    # another one only creates stale duplicate queue entries. Completed
+                    # or failed addresses, however, must be explicitly reopened.
+                    should_queue = status in {'done', 'failed'}
             self.conn.execute("COMMIT")
             return should_queue
         except Exception:
@@ -468,43 +480,115 @@ class StateStore:
         ).fetchall()
         return [WorkItem(address=row[0], depth=row[1]) for row in rows]
 
-    def mark_in_progress(self, address: str) -> bool:
-        cur = self.conn.execute(
-            """
-            UPDATE addresses SET status='in_progress', updated_at=?
-            WHERE address=? AND status='queued'
-            """,
-            (int(time.time()), address),
-        )
-        return cur.rowcount == 1
+    def claim(self, address: str) -> Optional[WorkItem]:
+        """Atomically claim a queued address and return its latest durable depth.
 
-    def mark_done(self, address: str) -> None:
-        self.conn.execute(
-            "UPDATE addresses SET status='done', last_error='', updated_at=? WHERE address=?",
-            (int(time.time()), address),
-        )
+        Queue entries are only wake-up hints. The database is authoritative because
+        an address may have been upgraded after an older WorkItem was enqueued.
+        """
+        now = int(time.time())
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.conn.execute(
+                "SELECT depth, status FROM addresses WHERE address=?",
+                (address,),
+            ).fetchone()
+            if row is None or str(row[1]) != "queued":
+                self.conn.execute("COMMIT")
+                return None
 
-    def mark_retry_or_failed(self, item: WorkItem, error: str) -> bool:
-        row = self.conn.execute(
-            "SELECT attempts FROM addresses WHERE address=?", (item.address,)
-        ).fetchone()
-        attempts = (row[0] if row else 0) + 1
-        retry = attempts <= CFG.max_address_retries
-        self.conn.execute(
-            """
-            UPDATE addresses
-            SET status=?, attempts=?, last_error=?, updated_at=?
-            WHERE address=?
-            """,
-            (
-                "queued" if retry else "failed",
-                attempts,
-                error[:1000],
-                int(time.time()),
-                item.address,
-            ),
-        )
-        return retry
+            depth = int(row[0])
+            cur = self.conn.execute(
+                """
+                UPDATE addresses
+                SET status='in_progress', updated_at=?
+                WHERE address=? AND status='queued'
+                """,
+                (now, address),
+            )
+            self.conn.execute("COMMIT")
+            if cur.rowcount != 1:
+                return None
+            return WorkItem(address=address, depth=depth)
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    def complete(self, item: WorkItem) -> Optional[WorkItem]:
+        """Finish a processed depth, or requeue if a deeper path arrived meanwhile."""
+        now = int(time.time())
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.conn.execute(
+                "SELECT depth, status FROM addresses WHERE address=?",
+                (item.address,),
+            ).fetchone()
+            if row is None:
+                self.conn.execute("COMMIT")
+                return None
+
+            durable_depth, status = int(row[0]), str(row[1])
+            if status != "in_progress":
+                self.conn.execute("COMMIT")
+                return None
+
+            if durable_depth > item.depth:
+                self.conn.execute(
+                    """
+                    UPDATE addresses
+                    SET status='queued', attempts=0, last_error='', updated_at=?
+                    WHERE address=?
+                    """,
+                    (now, item.address),
+                )
+                self.conn.execute("COMMIT")
+                return WorkItem(item.address, durable_depth)
+
+            self.conn.execute(
+                """
+                UPDATE addresses
+                SET status='done', last_error='', updated_at=?
+                WHERE address=?
+                """,
+                (now, item.address),
+            )
+            self.conn.execute("COMMIT")
+            return None
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    def mark_retry_or_failed(self, item: WorkItem, error: str) -> Optional[WorkItem]:
+        """Persist an address failure and return the latest-depth retry item, if any."""
+        now = int(time.time())
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.conn.execute(
+                "SELECT depth, attempts FROM addresses WHERE address=?",
+                (item.address,),
+            ).fetchone()
+            durable_depth = int(row[0]) if row else item.depth
+            attempts = (int(row[1]) if row else 0) + 1
+            retry = attempts <= CFG.max_address_retries
+            self.conn.execute(
+                """
+                UPDATE addresses
+                SET status=?, attempts=?, last_error=?, updated_at=?
+                WHERE address=?
+                """,
+                (
+                    "queued" if retry else "failed",
+                    attempts,
+                    error[:1000],
+                    now,
+                    item.address,
+                ),
+            )
+            self.conn.execute("COMMIT")
+            return WorkItem(item.address, durable_depth) if retry else None
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
 
     def insert_transaction_ids(self, ids: Iterable[str]) -> set[str]:
         new_ids: set[str] = set()
@@ -650,6 +734,15 @@ class EtherscanClient:
         result: list[dict[str, Any]] = []
         page = 1
         previous_page_signature: tuple[str, str, int] | None = None
+
+        def row_identity(row: dict[str, Any]) -> str:
+            return "|".join(
+                str(row.get(key, ""))
+                for key in (
+                    "hash", "traceId", "blockNumber", "transactionIndex",
+                    "from", "to", "contractAddress", "value",
+                )
+            )
         while not self.stop_event.is_set():
             if CFG.max_pages_per_address and page > CFG.max_pages_per_address:
                 return FetchOutcome(
@@ -676,8 +769,8 @@ class EtherscanClient:
 
             if valid_rows:
                 signature = (
-                    str(valid_rows[0].get("hash", "")),
-                    str(valid_rows[-1].get("hash", "")),
+                    row_identity(valid_rows[0]),
+                    row_identity(valid_rows[-1]),
                     len(valid_rows),
                 )
                 if signature == previous_page_signature:
@@ -798,6 +891,7 @@ def parse_transactions(rows: list[dict[str, Any]], stats: Stats) -> tuple[list[T
     for tx in rows:
         tx_hash = str(tx.get("hash", "")).strip()
         if not tx_hash:
+            stats.malformed_transactions += 1
             continue
         from_addr = normalize_address(tx.get("from"))
         raw_to = tx.get("to")
@@ -858,14 +952,16 @@ async def worker_loop(
             if stop_event.is_set():
                 # Leave durable status as queued for the next run.
                 continue
-            if not store.mark_in_progress(item.address):
+            claimed = store.claim(item.address)
+            if claimed is None:
                 continue
+            item = claimed
 
             outcome = await client.fetch_transactions(item.address)
             if not outcome.ok:
-                retry = store.mark_retry_or_failed(item, outcome.error)
-                if retry and not stop_event.is_set():
-                    await work_queue.put(item)
+                retry_item = store.mark_retry_or_failed(item, outcome.error)
+                if retry_item is not None and not stop_event.is_set():
+                    await work_queue.put(retry_item)
                 else:
                     stats.addresses_failed += 1
                 continue
@@ -881,8 +977,12 @@ async def worker_loop(
                     if store.enqueue(neighbor, item.depth - 1):
                         await work_queue.put(WorkItem(neighbor, item.depth - 1))
 
-            store.mark_done(item.address)
-            stats.addresses_done += 1
+            requeue_item = store.complete(item)
+            if requeue_item is not None:
+                if not stop_event.is_set():
+                    await work_queue.put(requeue_item)
+            else:
+                stats.addresses_done += 1
 
         except FatalAPIError as exc:
             logger.error("Fatal Etherscan API error: %s", exc)
@@ -893,9 +993,9 @@ async def worker_loop(
             raise
         except Exception as exc:
             logger.exception("Worker %s failed for %s", worker_id, item.address)
-            retry = store.mark_retry_or_failed(item, repr(exc))
-            if retry and not stop_event.is_set():
-                await work_queue.put(item)
+            retry_item = store.mark_retry_or_failed(item, repr(exc))
+            if retry_item is not None and not stop_event.is_set():
+                await work_queue.put(retry_item)
             else:
                 stats.addresses_failed += 1
         finally:
@@ -997,7 +1097,7 @@ async def run() -> int:
         )
         headers = {
             "Accept": "application/json",
-            "User-Agent": "etherscan-bfs-crawler/15.0",
+            "User-Agent": "etherscan-bfs-crawler/16.0",
         }
         limiter = TokenBucket(CFG.rate_limit_per_sec, CFG.burst_size)
         semaphore = asyncio.Semaphore(CFG.concurrent_requests)
