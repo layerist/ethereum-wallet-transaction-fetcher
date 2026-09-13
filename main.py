@@ -1,28 +1,21 @@
 #!/usr/bin/env python3
 """
-Reliable Async Etherscan BFS Crawler v16
+Reliable Async Etherscan BFS Crawler v17
 
-Main changes from v15:
-- Fixes a frontier race: a deeper path discovered while an address is in progress is never lost.
-- Workers atomically claim the latest durable depth instead of trusting stale queue items.
-- Completion atomically requeues an address when its depth was upgraded during processing.
-- Address retry logic also uses the latest durable depth.
-- Pagination loop detection uses stronger transaction identities, reducing false positives.
-- Malformed transactions with missing hashes are now counted in diagnostics.
-- Output/state path collision is rejected at startup.
-- Existing v15 durability, retry, shutdown, and writer guarantees are retained.
-
-Previously inherited changes:
-- Uses Etherscan API V2 by default (chainid is required).
-- Durable SQLite frontier: a restart continues queued/in-progress addresses.
-- A dedicated bounded writer queue provides backpressure and owns all NDJSON writes.
-- Address is marked done only after its transactions are durably persisted.
-- Internal transactions are deduplicated by hash + traceId, not only by hash.
-- Fetch failures are distinguishable from legitimate empty transaction lists.
-- Per-address retries prevent transient failures from silently marking an address visited.
-- Retry-After support, exponential backoff with full jitter, and fatal API error detection.
-- Atomic state transitions and graceful Ctrl+C/SIGTERM shutdown.
-- Optional fsync for stronger durability.
+Key improvements over v16:
+- Uses the current Etherscan Free-tier-safe default page size of 1,000.
+- Binds persistent state to crawl semantics so incompatible restarts fail closed.
+- Requeues interrupted in-progress work before exit, not only on the next launch.
+- Caps Retry-After delays and treats permanent HTTP/API failures as fatal.
+- Detects any repeated pagination signature, not only immediately repeated pages.
+- Rejects partially malformed API pages instead of silently dropping rows.
+- Optional per-address transaction cap prevents pathological memory growth.
+- Optional frontier cap prevents accidental unbounded graph explosions.
+- Stronger SQLite schema/version metadata and path-collision checks.
+- Better cancellation/error propagation between workers and the writer.
+- Writer keeps NDJSON as the durability authority and reconciles SQLite IDs at startup.
+- More complete metrics, including retries, pages, API rows and frontier upgrades.
+- Correct URL default (plain URL, not Markdown link syntax).
 
 Required environment variables:
   ETHERSCAN_API_KEY=...
@@ -33,19 +26,26 @@ Common optional variables:
   CRAWL_DEPTH=2
   CRAWL_WORKERS=8
   CRAWL_CONCURRENT_REQUESTS=8
-  ETHERSCAN_RATE_LIMIT_PER_SEC=2.8   # Free tier is currently 3 calls/sec
+  ETHERSCAN_RATE_LIMIT_PER_SEC=2.8
   ETHERSCAN_BURST_SIZE=3
+  ETHERSCAN_PAGE_SIZE=1000
   OUTPUT_FILE=transactions.ndjson
   STATE_DB=transactions.state.sqlite3
   INCLUDE_INTERNAL_TXS=false
   SKIP_SELF_TRANSFERS=false
   RESET_STATE=false
   FSYNC_WRITES=false
+
+Safety limits (0 = unlimited):
+  MAX_PAGES_PER_ADDRESS=0
+  MAX_TXS_PER_ADDRESS=0
+  MAX_FRONTIER_ADDRESSES=0
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -54,14 +54,20 @@ import re
 import signal
 import sqlite3
 import time
-from email.utils import parsedate_to_datetime
 from dataclasses import asdict, dataclass, field
 from decimal import Decimal, InvalidOperation
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
 import aiofiles
 import aiohttp
+
+
+SCHEMA_VERSION = "17"
+DEFAULT_BASE_URL = "https://api.etherscan.io/v2/api"
+RETRYABLE_HTTP = {408, 425, 429, 500, 502, 503, 504}
+ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 
 
 # =============================================================================
@@ -94,9 +100,7 @@ def env_float(name: str, default: float) -> float:
 @dataclass(frozen=True, slots=True)
 class Config:
     api_key: str = os.getenv("ETHERSCAN_API_KEY", "").strip()
-    base_url: str = os.getenv(
-        "ETHERSCAN_BASE_URL", "https://api.etherscan.io/v2/api"
-    ).strip()
+    base_url: str = os.getenv("ETHERSCAN_BASE_URL", DEFAULT_BASE_URL).strip()
     chain_id: str = os.getenv("ETHERSCAN_CHAIN_ID", "1").strip()
     start_address: str = os.getenv("START_ADDRESS", "").strip()
 
@@ -110,21 +114,25 @@ class Config:
 
     request_timeout_sec: float = env_float("ETHERSCAN_REQUEST_TIMEOUT", 30.0)
     connect_timeout_sec: float = env_float("ETHERSCAN_CONNECT_TIMEOUT", 10.0)
+    sock_read_timeout_sec: float = env_float("ETHERSCAN_SOCK_READ_TIMEOUT", 30.0)
     max_request_retries: int = env_int("ETHERSCAN_MAX_RETRIES", 8)
     max_address_retries: int = env_int("ADDRESS_MAX_RETRIES", 3)
     retry_base_sec: float = env_float("RETRY_BASE_SEC", 0.8)
     retry_cap_sec: float = env_float("RETRY_CAP_SEC", 30.0)
+    max_retry_after_sec: float = env_float("MAX_RETRY_AFTER_SEC", 120.0)
 
     startblock: int = env_int("ETHERSCAN_STARTBLOCK", 0)
     endblock: int = env_int("ETHERSCAN_ENDBLOCK", 99_999_999)
-    page_size: int = env_int("ETHERSCAN_PAGE_SIZE", 10_000)
+    # Since 2026-07-01 Etherscan Free tier caps affected account endpoints at 1,000.
+    page_size: int = env_int("ETHERSCAN_PAGE_SIZE", 1_000)
     max_pages_per_address: int = env_int("MAX_PAGES_PER_ADDRESS", 0)
+    max_txs_per_address: int = env_int("MAX_TXS_PER_ADDRESS", 0)
+    max_frontier_addresses: int = env_int("MAX_FRONTIER_ADDRESSES", 0)
 
     output_file: Path = Path(os.getenv("OUTPUT_FILE", "transactions.ndjson").strip())
-    state_db: Path = Path(
-        os.getenv("STATE_DB", "transactions.state.sqlite3").strip()
-    )
+    state_db: Path = Path(os.getenv("STATE_DB", "transactions.state.sqlite3").strip())
     fsync_writes: bool = env_bool("FSYNC_WRITES", False)
+    sqlite_synchronous: str = os.getenv("SQLITE_SYNCHRONOUS", "NORMAL").strip().upper()
 
     include_internal_txs: bool = env_bool("INCLUDE_INTERNAL_TXS", False)
     skip_self_transfers: bool = env_bool("SKIP_SELF_TRANSFERS", False)
@@ -142,15 +150,17 @@ class Config:
         if self.depth < 1:
             errors.append("CRAWL_DEPTH must be >= 1")
         if self.workers < 1 or self.concurrent_requests < 1:
-            errors.append("worker/concurrency values must be >= 1")
+            errors.append("CRAWL_WORKERS and CRAWL_CONCURRENT_REQUESTS must be >= 1")
         if self.rate_limit_per_sec <= 0 or self.burst_size < 1:
-            errors.append("rate limit and burst size must be positive")
+            errors.append("rate limit must be > 0 and burst size must be >= 1")
         if self.max_request_retries < 1 or self.max_address_retries < 0:
-            errors.append("retry values are invalid")
-        if self.request_timeout_sec <= 0 or self.connect_timeout_sec <= 0:
-            errors.append("request/connect timeouts must be positive")
+            errors.append("retry counts are invalid")
+        if min(self.request_timeout_sec, self.connect_timeout_sec, self.sock_read_timeout_sec) <= 0:
+            errors.append("HTTP timeout values must be positive")
         if self.retry_base_sec <= 0 or self.retry_cap_sec < self.retry_base_sec:
             errors.append("retry delay values are invalid")
+        if self.max_retry_after_sec <= 0:
+            errors.append("MAX_RETRY_AFTER_SEC must be positive")
         if self.writer_queue_size < 1:
             errors.append("WRITER_QUEUE_SIZE must be >= 1")
         if self.log_every_sec <= 0:
@@ -160,14 +170,27 @@ class Config:
         if not (1 <= self.page_size <= 10_000):
             errors.append("ETHERSCAN_PAGE_SIZE must be between 1 and 10000")
         if self.startblock < 0 or self.endblock < self.startblock:
-            errors.append("invalid startblock/endblock range")
+            errors.append("invalid ETHERSCAN_STARTBLOCK/ETHERSCAN_ENDBLOCK range")
+        if self.max_pages_per_address < 0 or self.max_txs_per_address < 0:
+            errors.append("MAX_PAGES_PER_ADDRESS/MAX_TXS_PER_ADDRESS cannot be negative")
+        if self.max_frontier_addresses < 0:
+            errors.append("MAX_FRONTIER_ADDRESSES cannot be negative")
+        if self.sqlite_synchronous not in {"OFF", "NORMAL", "FULL", "EXTRA"}:
+            errors.append("SQLITE_SYNCHRONOUS must be OFF, NORMAL, FULL, or EXTRA")
+
         try:
-            if self.output_file.resolve() == self.state_db.resolve():
-                errors.append("OUTPUT_FILE and STATE_DB must be different files")
+            output = self.output_file.resolve()
+            db = self.state_db.resolve()
+            forbidden = {
+                db,
+                Path(str(db) + "-wal"),
+                Path(str(db) + "-shm"),
+            }
+            if output in forbidden:
+                errors.append("OUTPUT_FILE collides with STATE_DB or its WAL/SHM files")
         except OSError:
-            # Parent paths may not exist yet; normal file creation will surface any
-            # remaining filesystem problem later.
             pass
+
         if errors:
             raise RuntimeError("Invalid configuration:\n- " + "\n- ".join(errors))
 
@@ -224,10 +247,16 @@ class WriteRequest:
 class Stats:
     started_monotonic: float = field(default_factory=time.monotonic)
     requests: int = 0
+    request_retries: int = 0
+    pages: int = 0
+    api_rows: int = 0
     http_errors: int = 0
     soft_errors: int = 0
     addresses_done: int = 0
     addresses_failed: int = 0
+    address_retries: int = 0
+    frontier_inserted: int = 0
+    frontier_upgraded: int = 0
     tx_observed: int = 0
     tx_written: int = 0
     tx_duplicates: int = 0
@@ -238,16 +267,16 @@ class FatalAPIError(RuntimeError):
     pass
 
 
+class FrontierLimitError(RuntimeError):
+    pass
+
+
 # =============================================================================
 # UTILITIES
 # =============================================================================
 
 
-ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
-
-
 def normalize_address(address: Any) -> Optional[str]:
-    """Validate and canonicalize an EVM address without requiring web3.py."""
     if not isinstance(address, str):
         return None
     value = address.strip()
@@ -274,63 +303,74 @@ def wei_to_eth_str(value: Any) -> str:
 
 
 def transaction_record_id(tx: dict[str, Any], kind: str) -> str:
-    tx_hash = str(tx.get("hash", "")).lower()
+    tx_hash = str(tx.get("hash", "")).strip().lower()
     if kind == "internal":
-        trace_id = str(tx.get("traceId", ""))
-        # Some explorer-compatible APIs omit traceId. The fallback keeps traces distinct.
+        trace_id = str(tx.get("traceId", "")).strip()
         if not trace_id:
-            trace_id = ":".join(
+            # Explorer-compatible APIs occasionally omit traceId. Hashing a broad set of
+            # trace fields avoids huge record IDs while keeping fallback identity stable.
+            fallback = "\x1f".join(
                 str(tx.get(key, ""))
                 for key in (
-                    "blockNumber", "transactionIndex", "type", "callType",
-                    "from", "to", "value", "gas", "gasUsed", "input",
+                    "blockNumber", "transactionIndex", "type", "callType", "from", "to",
+                    "contractAddress", "value", "gas", "gasUsed", "input", "isError",
                 )
             )
+            trace_id = "fallback-" + hashlib.sha256(fallback.encode("utf-8")).hexdigest()[:24]
         return f"internal:{tx_hash}:{trace_id}"
     return f"normal:{tx_hash}"
 
 
 def full_jitter_delay(attempt: int, base: float, cap: float) -> float:
-    return random.uniform(0.0, min(cap, base * (2**attempt)))
+    exponent = min(attempt, 30)
+    return random.uniform(0.0, min(cap, base * (2**exponent)))
 
 
-def parse_retry_after(value: Optional[str]) -> Optional[float]:
+def parse_retry_after(value: Optional[str], cap: float) -> Optional[float]:
     if not value:
         return None
+    delay: Optional[float]
     try:
-        return max(0.0, float(value))
+        delay = max(0.0, float(value))
     except ValueError:
         try:
             retry_at = parsedate_to_datetime(value)
-            return max(0.0, retry_at.timestamp() - time.time())
+            delay = max(0.0, retry_at.timestamp() - time.time())
         except (TypeError, ValueError, OverflowError):
             return None
+    return min(cap, delay)
 
 
 def is_no_transactions(data: dict[str, Any]) -> bool:
     result = data.get("result")
     message = str(data.get("message", "")).lower()
-    return result == [] or "no transactions found" in message
+    result_text = str(result).lower()
+    return (
+        result == []
+        or "no transactions found" in message
+        or "no transactions found" in result_text
+    )
 
 
 def api_error_text(data: dict[str, Any]) -> str:
-    return " | ".join(
-        part for part in (
-            str(data.get("message", "")).strip(),
-            str(data.get("result", "")).strip(),
-        ) if part
+    parts = (
+        str(data.get("message", "")).strip(),
+        str(data.get("result", "")).strip(),
     )
+    return " | ".join(part for part in parts if part)
 
 
 def classify_api_error(data: dict[str, Any]) -> str:
     text = api_error_text(data).lower()
     if any(token in text for token in (
-        "rate limit", "too many requests", "temporarily unavailable", "timeout"
+        "rate limit", "max rate limit", "too many requests", "temporarily unavailable",
+        "timeout", "server busy", "try again", "query timeout",
     )):
         return "retryable"
     if any(token in text for token in (
-        "invalid api key", "missing or unsupported chainid", "deprecated v1",
-        "invalid action", "invalid module"
+        "invalid api key", "missing api key", "unsupported chainid", "unsupported chain id",
+        "missing chainid", "deprecated v1", "invalid action", "invalid module",
+        "invalid address format", "invalid startblock", "invalid endblock",
     )):
         return "fatal"
     return "other"
@@ -348,6 +388,19 @@ def build_params(address: str, action: str, page: int) -> dict[str, str | int]:
         "offset": CFG.page_size,
         "sort": "asc",
         "apikey": CFG.api_key,
+    }
+
+
+def state_semantics(start_address: str) -> dict[str, Any]:
+    # Changing any of these can make previously completed addresses semantically stale.
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "chain_id": CFG.chain_id,
+        "start_address": start_address,
+        "startblock": CFG.startblock,
+        "endblock": CFG.endblock,
+        "include_internal_txs": CFG.include_internal_txs,
+        "skip_self_transfers": CFG.skip_self_transfers,
     }
 
 
@@ -390,23 +443,30 @@ class TokenBucket:
 
 
 class StateStore:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, stats: Stats) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
+        self.stats = stats
         self.conn = sqlite3.connect(path, timeout=30.0, isolation_level=None)
         self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute(f"PRAGMA synchronous={CFG.sqlite_synchronous}")
         self.conn.execute("PRAGMA busy_timeout=30000")
+        self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.executescript(
             """
+            CREATE TABLE IF NOT EXISTS metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS addresses (
                 address TEXT PRIMARY KEY,
-                depth INTEGER NOT NULL,
+                depth INTEGER NOT NULL CHECK(depth >= 1),
                 status TEXT NOT NULL CHECK(status IN ('queued','in_progress','done','failed')),
-                attempts INTEGER NOT NULL DEFAULT 0,
+                attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
                 last_error TEXT NOT NULL DEFAULT '',
                 updated_at INTEGER NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_addresses_status
+            CREATE INDEX IF NOT EXISTS idx_addresses_status_depth
                 ON addresses(status, depth DESC);
 
             CREATE TABLE IF NOT EXISTS transaction_ids (
@@ -420,22 +480,53 @@ class StateStore:
         self.conn.close()
 
     def reset(self) -> None:
-        self.conn.executescript("DELETE FROM addresses; DELETE FROM transaction_ids;")
+        self.conn.executescript(
+            "DELETE FROM addresses; DELETE FROM transaction_ids; DELETE FROM metadata;"
+        )
 
-    def recover(self) -> None:
+    def bind_semantics(self, semantics: dict[str, Any]) -> None:
+        encoded = {key: json.dumps(value, sort_keys=True) for key, value in semantics.items()}
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            existing = dict(self.conn.execute("SELECT key, value FROM metadata").fetchall())
+            if not existing:
+                self.conn.executemany(
+                    "INSERT INTO metadata(key, value) VALUES (?, ?)",
+                    encoded.items(),
+                )
+            else:
+                mismatches: list[str] = []
+                for key, expected in encoded.items():
+                    actual = existing.get(key)
+                    if actual != expected:
+                        mismatches.append(
+                            f"{key}: state={actual!r}, current={expected!r}"
+                        )
+                if mismatches:
+                    raise RuntimeError(
+                        "STATE_DB belongs to incompatible crawl semantics. "
+                        "Use the original configuration or RESET_STATE=true.\n- "
+                        + "\n- ".join(mismatches)
+                    )
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    def recover(self) -> int:
         now = int(time.time())
-        self.conn.execute(
+        cur = self.conn.execute(
             "UPDATE addresses SET status='queued', updated_at=? WHERE status='in_progress'",
             (now,),
         )
+        return max(0, cur.rowcount)
+
+    def frontier_count(self) -> int:
+        row = self.conn.execute("SELECT COUNT(*) FROM addresses").fetchone()
+        return int(row[0]) if row else 0
 
     def enqueue(self, address: str, depth: int) -> bool:
-        """Insert a new frontier item or upgrade an existing item to a deeper crawl.
-
-        Returns True only when the caller must place the address into the in-memory queue.
-        A completed/failed address is reopened when a deeper path is discovered because the
-        earlier shallower visit could not have expanded all levels now requested.
-        """
+        """Insert/upgrade an address. Return True iff an in-memory wake-up is needed."""
         now = int(time.time())
         self.conn.execute("BEGIN IMMEDIATE")
         try:
@@ -443,7 +534,15 @@ class StateStore:
                 "SELECT depth, status FROM addresses WHERE address=?", (address,)
             ).fetchone()
             should_queue = False
+
             if row is None:
+                if CFG.max_frontier_addresses:
+                    count_row = self.conn.execute("SELECT COUNT(*) FROM addresses").fetchone()
+                    count = int(count_row[0]) if count_row else 0
+                    if count >= CFG.max_frontier_addresses:
+                        raise FrontierLimitError(
+                            f"MAX_FRONTIER_ADDRESSES={CFG.max_frontier_addresses} reached"
+                        )
                 self.conn.execute(
                     """
                     INSERT INTO addresses(address, depth, status, attempts, last_error, updated_at)
@@ -451,11 +550,12 @@ class StateStore:
                     """,
                     (address, depth, now),
                 )
+                self.stats.frontier_inserted += 1
                 should_queue = True
             else:
                 old_depth, status = int(row[0]), str(row[1])
                 if depth > old_depth:
-                    new_status = 'in_progress' if status == 'in_progress' else 'queued'
+                    new_status = "in_progress" if status == "in_progress" else "queued"
                     self.conn.execute(
                         """
                         UPDATE addresses
@@ -464,10 +564,10 @@ class StateStore:
                         """,
                         (depth, new_status, now, address),
                     )
-                    # A queued address already has a wake-up item in memory. Adding
-                    # another one only creates stale duplicate queue entries. Completed
-                    # or failed addresses, however, must be explicitly reopened.
-                    should_queue = status in {'done', 'failed'}
+                    self.stats.frontier_upgraded += 1
+                    # queued already has a queue token; in_progress will be requeued by complete().
+                    should_queue = status in {"done", "failed"}
+
             self.conn.execute("COMMIT")
             return should_queue
         except Exception:
@@ -476,22 +576,16 @@ class StateStore:
 
     def queued_items(self) -> list[WorkItem]:
         rows = self.conn.execute(
-            "SELECT address, depth FROM addresses WHERE status='queued' ORDER BY depth DESC"
+            "SELECT address, depth FROM addresses WHERE status='queued' ORDER BY depth DESC, address"
         ).fetchall()
-        return [WorkItem(address=row[0], depth=row[1]) for row in rows]
+        return [WorkItem(address=str(row[0]), depth=int(row[1])) for row in rows]
 
     def claim(self, address: str) -> Optional[WorkItem]:
-        """Atomically claim a queued address and return its latest durable depth.
-
-        Queue entries are only wake-up hints. The database is authoritative because
-        an address may have been upgraded after an older WorkItem was enqueued.
-        """
         now = int(time.time())
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             row = self.conn.execute(
-                "SELECT depth, status FROM addresses WHERE address=?",
-                (address,),
+                "SELECT depth, status FROM addresses WHERE address=?", (address,)
             ).fetchone()
             if row is None or str(row[1]) != "queued":
                 self.conn.execute("COMMIT")
@@ -515,13 +609,11 @@ class StateStore:
             raise
 
     def complete(self, item: WorkItem) -> Optional[WorkItem]:
-        """Finish a processed depth, or requeue if a deeper path arrived meanwhile."""
         now = int(time.time())
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             row = self.conn.execute(
-                "SELECT depth, status FROM addresses WHERE address=?",
-                (item.address,),
+                "SELECT depth, status FROM addresses WHERE address=?", (item.address,)
             ).fetchone()
             if row is None:
                 self.conn.execute("COMMIT")
@@ -547,7 +639,7 @@ class StateStore:
             self.conn.execute(
                 """
                 UPDATE addresses
-                SET status='done', last_error='', updated_at=?
+                SET status='done', attempts=0, last_error='', updated_at=?
                 WHERE address=?
                 """,
                 (now, item.address),
@@ -559,16 +651,24 @@ class StateStore:
             raise
 
     def mark_retry_or_failed(self, item: WorkItem, error: str) -> Optional[WorkItem]:
-        """Persist an address failure and return the latest-depth retry item, if any."""
         now = int(time.time())
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             row = self.conn.execute(
-                "SELECT depth, attempts FROM addresses WHERE address=?",
+                "SELECT depth, attempts, status FROM addresses WHERE address=?",
                 (item.address,),
             ).fetchone()
-            durable_depth = int(row[0]) if row else item.depth
-            attempts = (int(row[1]) if row else 0) + 1
+            if row is None:
+                self.conn.execute("COMMIT")
+                return None
+
+            durable_depth, old_attempts, status = int(row[0]), int(row[1]), str(row[2])
+            # Do not overwrite a state another path has already moved away from in_progress.
+            if status != "in_progress":
+                self.conn.execute("COMMIT")
+                return None
+
+            attempts = old_attempts + 1
             retry = attempts <= CFG.max_address_retries
             self.conn.execute(
                 """
@@ -590,9 +690,9 @@ class StateStore:
             self.conn.execute("ROLLBACK")
             raise
 
-    def insert_transaction_ids(self, ids: Iterable[str]) -> set[str]:
-        new_ids: set[str] = set()
+    def insert_transaction_ids(self, ids: Iterable[str]) -> int:
         now = int(time.time())
+        inserted = 0
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             for record_id in ids:
@@ -601,19 +701,19 @@ class StateStore:
                     (record_id, now),
                 )
                 if cur.rowcount == 1:
-                    new_ids.add(record_id)
+                    inserted += 1
             self.conn.execute("COMMIT")
+            return inserted
         except Exception:
             self.conn.execute("ROLLBACK")
             raise
-        return new_ids
 
     def counts(self) -> dict[str, int]:
         result = {"queued": 0, "in_progress": 0, "done": 0, "failed": 0}
         for status, count in self.conn.execute(
             "SELECT status, COUNT(*) FROM addresses GROUP BY status"
         ):
-            result[status] = count
+            result[str(status)] = int(count)
         return result
 
 
@@ -637,112 +737,145 @@ class EtherscanClient:
         self.stop_event = stop_event
         self.stats = stats
 
+    async def _sleep_or_stop(self, delay: float) -> bool:
+        if delay <= 0:
+            return not self.stop_event.is_set()
+        try:
+            await asyncio.wait_for(self.stop_event.wait(), timeout=delay)
+            return False
+        except asyncio.TimeoutError:
+            return True
+
     async def _request(self, params: dict[str, Any]) -> Optional[dict[str, Any]]:
+        last_error = "request failed"
         for attempt in range(CFG.max_request_retries):
+            if self.stop_event.is_set():
+                return None
             if not await self.limiter.acquire(self.stop_event):
                 return None
+
+            if attempt:
+                self.stats.request_retries += 1
+
             try:
                 async with self.semaphore:
                     async with self.session.get(CFG.base_url, params=params) as response:
                         self.stats.requests += 1
-                        if response.status == 429:
-                            self.stats.http_errors += 1
-                            delay = parse_retry_after(response.headers.get("Retry-After"))
-                            if delay is None:
-                                delay = full_jitter_delay(
-                                    attempt, CFG.retry_base_sec, CFG.retry_cap_sec
-                                )
-                            await self._sleep_or_stop(delay)
-                            continue
-
-                        if response.status in {408, 425, 500, 502, 503, 504}:
-                            self.stats.http_errors += 1
-                            delay = parse_retry_after(response.headers.get("Retry-After"))
-                            if delay is None:
-                                delay = full_jitter_delay(
-                                    attempt, CFG.retry_base_sec, CFG.retry_cap_sec
-                                )
-                            await self._sleep_or_stop(delay)
-                            continue
-
+                        status = response.status
                         body = await response.text()
-                        if response.status != 200:
+
+                        if status in RETRYABLE_HTTP:
                             self.stats.http_errors += 1
-                            logger.warning(
-                                "HTTP %s for %s: %s",
-                                response.status,
-                                response.url.with_query(""),
-                                body[:300],
+                            last_error = f"HTTP {status}"
+                            if attempt + 1 >= CFG.max_request_retries:
+                                break
+                            delay = parse_retry_after(
+                                response.headers.get("Retry-After"), CFG.max_retry_after_sec
                             )
-                            if 400 <= response.status < 500:
-                                logger.error(
-                                    "Non-retryable HTTP %s for action=%s address=%s: %s",
-                                    response.status, params.get("action"), params.get("address"),
-                                    body[:500],
+                            if delay is None:
+                                delay = full_jitter_delay(
+                                    attempt, CFG.retry_base_sec, CFG.retry_cap_sec
                                 )
+                            if not await self._sleep_or_stop(delay):
                                 return None
-                            await self._sleep_or_stop(
+                            continue
+
+                        if status in {401, 403}:
+                            raise FatalAPIError(f"HTTP {status}: {body[:500]}")
+
+                        if status != 200:
+                            self.stats.http_errors += 1
+                            last_error = f"HTTP {status}: {body[:300]}"
+                            # Other 4xx responses are permanent for the exact request.
+                            if 400 <= status < 500:
+                                raise FatalAPIError(last_error)
+                            if attempt + 1 >= CFG.max_request_retries:
+                                break
+                            if not await self._sleep_or_stop(
                                 full_jitter_delay(attempt, CFG.retry_base_sec, CFG.retry_cap_sec)
-                            )
+                            ):
+                                return None
                             continue
 
                         try:
                             data = json.loads(body)
-                        except json.JSONDecodeError:
+                        except json.JSONDecodeError as exc:
                             self.stats.http_errors += 1
-                            await self._sleep_or_stop(
+                            last_error = f"invalid JSON: {exc}"
+                            if attempt + 1 >= CFG.max_request_retries:
+                                break
+                            if not await self._sleep_or_stop(
                                 full_jitter_delay(attempt, CFG.retry_base_sec, CFG.retry_cap_sec)
-                            )
+                            ):
+                                return None
                             continue
 
                         if not isinstance(data, dict):
-                            return None
+                            self.stats.http_errors += 1
+                            last_error = f"unexpected JSON root type: {type(data).__name__}"
+                            if attempt + 1 >= CFG.max_request_retries:
+                                break
+                            if not await self._sleep_or_stop(
+                                full_jitter_delay(attempt, CFG.retry_base_sec, CFG.retry_cap_sec)
+                            ):
+                                return None
+                            continue
 
-                        if data.get("status") == "0" and not is_no_transactions(data):
+                        status_value = str(data.get("status", ""))
+                        if status_value == "0" and not is_no_transactions(data):
                             classification = classify_api_error(data)
+                            text = api_error_text(data) or "unknown Etherscan API error"
                             if classification == "fatal":
-                                raise FatalAPIError(api_error_text(data))
+                                raise FatalAPIError(text)
                             if classification == "retryable":
                                 self.stats.soft_errors += 1
-                                await self._sleep_or_stop(
+                                last_error = text
+                                if attempt + 1 >= CFG.max_request_retries:
+                                    break
+                                if not await self._sleep_or_stop(
                                     full_jitter_delay(
                                         attempt, CFG.retry_base_sec, CFG.retry_cap_sec
                                     )
-                                )
+                                ):
+                                    return None
                                 continue
+                            # Unknown NOTOK is not safe to reinterpret as a valid empty result.
+                            raise FatalAPIError(f"Non-retryable Etherscan API error: {text}")
+
                         return data
 
             except FatalAPIError:
                 raise
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 self.stats.http_errors += 1
-                if attempt + 1 == CFG.max_request_retries:
-                    logger.debug("Request exhausted retries: %r", exc)
+                last_error = repr(exc)
+                if attempt + 1 >= CFG.max_request_retries:
                     break
-                await self._sleep_or_stop(
+                if not await self._sleep_or_stop(
                     full_jitter_delay(attempt, CFG.retry_base_sec, CFG.retry_cap_sec)
-                )
-        return None
+                ):
+                    return None
 
-    async def _sleep_or_stop(self, delay: float) -> None:
-        try:
-            await asyncio.wait_for(self.stop_event.wait(), timeout=max(0.0, delay))
-        except asyncio.TimeoutError:
-            pass
+        logger.debug(
+            "Request exhausted retries action=%s address=%s: %s",
+            params.get("action"), params.get("address"), last_error,
+        )
+        return None
 
     async def fetch_action(self, address: str, action: str) -> FetchOutcome:
         result: list[dict[str, Any]] = []
         page = 1
-        previous_page_signature: tuple[str, str, int] | None = None
+        seen_signatures: set[tuple[str, str, int]] = set()
 
         def row_identity(row: dict[str, Any]) -> str:
             return "|".join(
                 str(row.get(key, ""))
                 for key in (
-                    "hash", "traceId", "blockNumber", "transactionIndex",
-                    "from", "to", "contractAddress", "value",
+                    "hash", "traceId", "blockNumber", "transactionIndex", "from", "to",
+                    "contractAddress", "value", "type", "callType",
                 )
             )
+
         while not self.stop_event.is_set():
             if CFG.max_pages_per_address and page > CFG.max_pages_per_address:
                 return FetchOutcome(
@@ -753,6 +886,8 @@ class EtherscanClient:
             data = await self._request(build_params(address, action, page))
             if data is None:
                 return FetchOutcome(ok=False, error=f"request failed for {action} page {page}")
+            self.stats.pages += 1
+
             if is_no_transactions(data):
                 return FetchOutcome(ok=True, transactions=result)
 
@@ -762,10 +897,14 @@ class EtherscanClient:
                     ok=False,
                     error=f"unexpected result for {action}: {api_error_text(data)[:300]}",
                 )
+            if any(not isinstance(row, dict) for row in page_rows):
+                return FetchOutcome(
+                    ok=False,
+                    error=f"malformed row(s) for {action} page {page}",
+                )
 
-            valid_rows = [row for row in page_rows if isinstance(row, dict)]
-            if page_rows and not valid_rows:
-                return FetchOutcome(ok=False, error=f"malformed rows for {action} page {page}")
+            valid_rows: list[dict[str, Any]] = page_rows
+            self.stats.api_rows += len(valid_rows)
 
             if valid_rows:
                 signature = (
@@ -773,12 +912,21 @@ class EtherscanClient:
                     row_identity(valid_rows[-1]),
                     len(valid_rows),
                 )
-                if signature == previous_page_signature:
+                if signature in seen_signatures:
                     return FetchOutcome(
                         ok=False,
-                        error=f"repeated page detected for {action} page {page}",
+                        error=f"pagination cycle detected for {action} page {page}",
                     )
-                previous_page_signature = signature
+                seen_signatures.add(signature)
+
+            if CFG.max_txs_per_address and len(result) + len(valid_rows) > CFG.max_txs_per_address:
+                return FetchOutcome(
+                    ok=False,
+                    error=(
+                        f"MAX_TXS_PER_ADDRESS={CFG.max_txs_per_address} exceeded "
+                        f"for {action}"
+                    ),
+                )
 
             result.extend(valid_rows)
             if len(page_rows) < CFG.page_size:
@@ -814,19 +962,26 @@ async def load_output_ids(path: Path) -> set[str]:
     ids: set[str] = set()
     if not path.exists():
         return ids
-    logger.info("Scanning existing output: %s", path)
+
+    logger.info("Scanning existing output for restart dedupe: %s", path)
+    line_no = 0
     async with aiofiles.open(path, "r", encoding="utf-8") as file:
         async for line in file:
+            line_no += 1
+            if not line.strip():
+                continue
             try:
                 row = json.loads(line)
+                if not isinstance(row, dict):
+                    continue
                 record_id = row.get("record_id")
                 if record_id:
                     ids.add(str(record_id))
                 elif row.get("hash"):
-                    # Compatibility with v13 normal-transaction output.
+                    # Compatibility with old normal-transaction-only output.
                     ids.add(f"normal:{str(row['hash']).lower()}")
             except (json.JSONDecodeError, AttributeError, TypeError):
-                continue
+                logger.warning("Ignoring malformed existing NDJSON line %s", line_no)
     logger.info("Loaded %s output record IDs", len(ids))
     return ids
 
@@ -845,15 +1000,17 @@ async def writer_loop(
                 if request is None:
                     return
 
-                transactions = request.transactions
                 unique: dict[str, Transaction] = {}
-                for tx in transactions:
+                for tx in request.transactions:
                     unique.setdefault(tx.record_id, tx)
-                to_append = [tx for tx in unique.values() if tx.record_id not in output_ids]
 
-                # NDJSON is the user-facing durable artifact. Flush it first; only then
-                # record IDs in SQLite. A crash between these two steps can cause a DB
-                # replay, but load_output_ids() prevents duplicate output on restart.
+                to_append = [
+                    tx for tx in unique.values() if tx.record_id not in output_ids
+                ]
+
+                # NDJSON is authoritative. Persist it first. Only after the append is
+                # flushed do we mirror IDs into SQLite. If the process dies in-between,
+                # startup rescans NDJSON and repairs SQLite without duplicating output.
                 if to_append:
                     payload = "".join(
                         json.dumps(asdict(tx), ensure_ascii=False, separators=(",", ":")) + "\n"
@@ -865,12 +1022,16 @@ async def writer_loop(
                         await asyncio.to_thread(os.fsync, file.fileno())
                     output_ids.update(tx.record_id for tx in to_append)
 
-                store.insert_transaction_ids(unique)
+                store.insert_transaction_ids(unique.keys())
                 appended = len(to_append)
                 stats.tx_written += appended
-                stats.tx_duplicates += len(transactions) - appended
+                stats.tx_duplicates += len(request.transactions) - appended
                 if not request.done.done():
                     request.done.set_result(appended)
+            except asyncio.CancelledError:
+                if request is not None and not request.done.done():
+                    request.done.cancel()
+                raise
             except Exception as exc:
                 if request is not None and not request.done.done():
                     request.done.set_exception(exc)
@@ -884,28 +1045,33 @@ async def writer_loop(
 # =============================================================================
 
 
-def parse_transactions(rows: list[dict[str, Any]], stats: Stats) -> tuple[list[Transaction], set[str]]:
+def parse_transactions(
+    rows: list[dict[str, Any]], stats: Stats
+) -> tuple[list[Transaction], set[str]]:
     records: list[Transaction] = []
     neighbors: set[str] = set()
 
     for tx in rows:
-        tx_hash = str(tx.get("hash", "")).strip()
+        tx_hash = str(tx.get("hash", "")).strip().lower()
         if not tx_hash:
             stats.malformed_transactions += 1
             continue
+
         from_addr = normalize_address(tx.get("from"))
         raw_to = tx.get("to")
         to_addr = normalize_address(raw_to)
         contract_address = normalize_address(tx.get("contractAddress"))
+
         if not from_addr:
             stats.malformed_transactions += 1
             continue
-        # Contract-creation transactions legitimately have an empty `to`. Preserve
-        # the record and use the created contract as the graph neighbor when available.
-        output_to = to_addr or contract_address or ""
+
+        # Empty `to` is legitimate for contract creation.
         if raw_to not in (None, "") and not to_addr:
             stats.malformed_transactions += 1
             continue
+
+        output_to = to_addr or contract_address or ""
         if CFG.skip_self_transfers and to_addr and from_addr == to_addr:
             continue
 
@@ -926,6 +1092,7 @@ def parse_transactions(rows: list[dict[str, Any]], stats: Stats) -> tuple[list[T
                 is_error=str(tx.get("isError", "")),
             )
         )
+
         neighbors.add(from_addr)
         if to_addr:
             neighbors.add(to_addr)
@@ -934,6 +1101,25 @@ def parse_transactions(rows: list[dict[str, Any]], stats: Stats) -> tuple[list[T
 
     stats.tx_observed += len(records)
     return records, neighbors
+
+
+async def enqueue_retry_with_backoff(
+    work_queue: asyncio.Queue[WorkItem],
+    item: WorkItem,
+    attempts: int,
+    stop_event: asyncio.Event,
+) -> None:
+    delay = full_jitter_delay(
+        max(0, attempts - 1), CFG.retry_base_sec, CFG.retry_cap_sec
+    )
+    if delay > 0:
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=delay)
+            return
+        except asyncio.TimeoutError:
+            pass
+    if not stop_event.is_set():
+        await work_queue.put(item)
 
 
 async def worker_loop(
@@ -948,10 +1134,11 @@ async def worker_loop(
 ) -> None:
     while True:
         item = await work_queue.get()
+        claimed: Optional[WorkItem] = None
         try:
             if stop_event.is_set():
-                # Leave durable status as queued for the next run.
                 continue
+
             claimed = store.claim(item.address)
             if claimed is None:
                 continue
@@ -961,7 +1148,15 @@ async def worker_loop(
             if not outcome.ok:
                 retry_item = store.mark_retry_or_failed(item, outcome.error)
                 if retry_item is not None and not stop_event.is_set():
-                    await work_queue.put(retry_item)
+                    stats.address_retries += 1
+                    # Address-level backoff avoids a hot retry loop after HTTP retries fail.
+                    attempts_row = store.conn.execute(
+                        "SELECT attempts FROM addresses WHERE address=?", (item.address,)
+                    ).fetchone()
+                    attempts = int(attempts_row[0]) if attempts_row else 1
+                    await enqueue_retry_with_backoff(
+                        work_queue, retry_item, attempts, stop_event
+                    )
                 else:
                     stats.addresses_failed += 1
                 continue
@@ -973,9 +1168,12 @@ async def worker_loop(
                 await future
 
             if item.depth > 1:
+                next_depth = item.depth - 1
                 for neighbor in neighbors:
-                    if store.enqueue(neighbor, item.depth - 1):
-                        await work_queue.put(WorkItem(neighbor, item.depth - 1))
+                    if neighbor == item.address:
+                        continue
+                    if store.enqueue(neighbor, next_depth):
+                        await work_queue.put(WorkItem(neighbor, next_depth))
 
             requeue_item = store.complete(item)
             if requeue_item is not None:
@@ -986,18 +1184,30 @@ async def worker_loop(
 
         except FatalAPIError as exc:
             logger.error("Fatal Etherscan API error: %s", exc)
-            store.mark_retry_or_failed(item, str(exc))
+            if claimed is not None:
+                store.mark_retry_or_failed(item, str(exc))
+            fatal_event.set()
+            stop_event.set()
+        except FrontierLimitError as exc:
+            logger.error("Frontier safety limit reached: %s", exc)
+            if claimed is not None:
+                store.mark_retry_or_failed(item, str(exc))
             fatal_event.set()
             stop_event.set()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.exception("Worker %s failed for %s", worker_id, item.address)
-            retry_item = store.mark_retry_or_failed(item, repr(exc))
-            if retry_item is not None and not stop_event.is_set():
-                await work_queue.put(retry_item)
+            if claimed is not None:
+                retry_item = store.mark_retry_or_failed(item, repr(exc))
+                if retry_item is not None and not stop_event.is_set():
+                    stats.address_retries += 1
+                    await work_queue.put(retry_item)
+                else:
+                    stats.addresses_failed += 1
             else:
-                stats.addresses_failed += 1
+                fatal_event.set()
+                stop_event.set()
         finally:
             work_queue.task_done()
 
@@ -1009,21 +1219,36 @@ async def monitor_loop(
     stop_event: asyncio.Event,
     stats: Stats,
 ) -> None:
+    last_requests = 0
+    last_rows = 0
+    last_time = stats.started_monotonic
+
     while not stop_event.is_set():
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=CFG.log_every_sec)
             return
         except asyncio.TimeoutError:
             pass
+
         counts = store.counts()
-        elapsed = max(0.001, time.monotonic() - stats.started_monotonic)
+        now = time.monotonic()
+        elapsed = max(0.001, now - stats.started_monotonic)
+        interval = max(0.001, now - last_time)
+        req_rate = (stats.requests - last_requests) / interval
+        row_rate = (stats.api_rows - last_rows) / interval
+        last_requests = stats.requests
+        last_rows = stats.api_rows
+        last_time = now
+
         logger.info(
             "addr done=%s queued=%s active=%s failed=%s | work_q=%s writer_q=%s | "
-            "tx observed=%s new=%s dup=%s malformed=%s | req=%s http_err=%s soft_err=%s | %.2f tx/s",
+            "tx observed=%s new=%s dup=%s malformed=%s | req=%s retry=%s pages=%s "
+            "http_err=%s api_retry=%s | %.2f req/s %.1f rows/s | elapsed=%.1fs",
             counts["done"], counts["queued"], counts["in_progress"], counts["failed"],
             work_queue.qsize(), writer_queue.qsize(), stats.tx_observed,
-            stats.tx_written, stats.tx_duplicates, stats.malformed_transactions, stats.requests,
-            stats.http_errors, stats.soft_errors, stats.tx_observed / elapsed,
+            stats.tx_written, stats.tx_duplicates, stats.malformed_transactions,
+            stats.requests, stats.request_retries, stats.pages, stats.http_errors,
+            stats.soft_errors, req_rate, row_rate, elapsed,
         )
 
 
@@ -1032,61 +1257,80 @@ async def monitor_loop(
 # =============================================================================
 
 
+def remove_state_files(path: Path) -> None:
+    for candidate in (path, Path(str(path) + "-wal"), Path(str(path) + "-shm")):
+        candidate.unlink(missing_ok=True)
+
+
 async def run() -> int:
     CFG.validate()
     start = normalize_address(CFG.start_address)
     if not start:
         raise RuntimeError("START_ADDRESS is not a valid EVM address")
 
+    if CFG.page_size > 1_000:
+        logger.warning(
+            "ETHERSCAN_PAGE_SIZE=%s exceeds the current Free-tier cap of 1000 for "
+            "affected account endpoints; use this only if your plan supports it",
+            CFG.page_size,
+        )
+
     if CFG.reset_state:
         CFG.output_file.unlink(missing_ok=True)
-        CFG.state_db.unlink(missing_ok=True)
-        Path(str(CFG.state_db) + "-wal").unlink(missing_ok=True)
-        Path(str(CFG.state_db) + "-shm").unlink(missing_ok=True)
+        remove_state_files(CFG.state_db)
 
-    store = StateStore(CFG.state_db)
+    stats = Stats()
+    store = StateStore(CFG.state_db, stats)
     stop_event = asyncio.Event()
     fatal_event = asyncio.Event()
-    stats = Stats()
 
     loop = asyncio.get_running_loop()
 
     def request_shutdown() -> None:
         if not stop_event.is_set():
-            logger.warning("Shutdown requested; current work will be checkpointed")
+            logger.warning("Shutdown requested; unfinished work will remain restartable")
             stop_event.set()
 
+    installed_signals: list[signal.Signals] = []
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, request_shutdown)
+            installed_signals.append(sig)
         except (NotImplementedError, RuntimeError):
-            # Windows Proactor loops may not support add_signal_handler.
             pass
 
     try:
-        store.recover()
+        store.bind_semantics(state_semantics(start))
+        recovered = store.recover()
+        if recovered:
+            logger.warning("Recovered %s interrupted in-progress address(es)", recovered)
+
         store.enqueue(start, CFG.depth)
         queued = store.queued_items()
         if not queued:
-            logger.info("No queued addresses. Crawl is already complete for this state DB.")
+            counts = store.counts()
+            logger.info(
+                "No queued addresses. Existing state: done=%s failed=%s",
+                counts["done"], counts["failed"],
+            )
             return 0
 
-        # The dynamically expanding BFS queue must remain unbounded: a bounded queue can
-        # deadlock when every worker is simultaneously adding newly discovered neighbors.
         work_queue: asyncio.Queue[WorkItem] = asyncio.Queue()
         writer_queue: asyncio.Queue[Optional[WriteRequest]] = asyncio.Queue(
             CFG.writer_queue_size
         )
         for item in queued:
-            await work_queue.put(item)
+            work_queue.put_nowait(item)
 
         output_ids = await load_output_ids(CFG.output_file)
-        # Populate SQLite IDs from existing output for v13 -> v14 migration.
-        store.insert_transaction_ids(output_ids)
+        repaired = store.insert_transaction_ids(output_ids)
+        if repaired:
+            logger.info("Reconciled %s transaction IDs into SQLite", repaired)
 
         timeout = aiohttp.ClientTimeout(
             total=CFG.request_timeout_sec,
             connect=CFG.connect_timeout_sec,
+            sock_read=CFG.sock_read_timeout_sec,
         )
         connector = aiohttp.TCPConnector(
             limit=CFG.concurrent_requests,
@@ -1097,7 +1341,7 @@ async def run() -> int:
         )
         headers = {
             "Accept": "application/json",
-            "User-Agent": "etherscan-bfs-crawler/16.0",
+            "User-Agent": "etherscan-bfs-crawler/17.0",
         }
         limiter = TokenBucket(CFG.rate_limit_per_sec, CFG.burst_size)
         semaphore = asyncio.Semaphore(CFG.concurrent_requests)
@@ -1106,13 +1350,11 @@ async def run() -> int:
             timeout=timeout,
             connector=connector,
             headers=headers,
+            raise_for_status=False,
         ) as session:
-            client = EtherscanClient(
-                session, semaphore, limiter, stop_event, stats
-            )
+            client = EtherscanClient(session, semaphore, limiter, stop_event, stats)
             writer_task = asyncio.create_task(
-                writer_loop(store, writer_queue, output_ids, stats),
-                name="writer",
+                writer_loop(store, writer_queue, output_ids, stats), name="writer"
             )
             workers = [
                 asyncio.create_task(
@@ -1131,30 +1373,34 @@ async def run() -> int:
 
             join_task = asyncio.create_task(work_queue.join(), name="work-join")
             stop_task = asyncio.create_task(stop_event.wait(), name="stop-wait")
-            done, pending = await asyncio.wait(
-                {join_task, stop_task, writer_task}, return_when=asyncio.FIRST_COMPLETED
+
+            done, _ = await asyncio.wait(
+                {join_task, stop_task, writer_task},
+                return_when=asyncio.FIRST_COMPLETED,
             )
 
+            normal_drain = join_task in done and not stop_event.is_set()
+
             if writer_task in done:
-                exc = writer_task.exception()
+                try:
+                    exc = writer_task.exception()
+                except asyncio.CancelledError:
+                    exc = RuntimeError("writer task was unexpectedly cancelled")
                 if exc is not None:
                     logger.error("Writer task failed: %r", exc)
-                    fatal_event.set()
-                    stop_event.set()
                 else:
-                    fatal_event.set()
-                    stop_event.set()
-            elif join_task in done:
+                    logger.error("Writer task exited unexpectedly")
+                fatal_event.set()
+                stop_event.set()
+            elif normal_drain:
                 stop_event.set()
 
-            # Workers may be blocked in queue.get() after a normal drain, or may still be
-            # processing during shutdown. SQLite recovery returns in-progress work to the
-            # queue on the next launch, so cancellation is safe here.
+            # Stop workers. Any address cancelled while in_progress is requeued below.
             for worker in workers:
                 worker.cancel()
             await asyncio.gather(*workers, return_exceptions=True)
 
-            # Persist all requests already accepted by the writer before stopping it.
+            # Requests already put into the writer queue must finish before writer shutdown.
             if not writer_task.done():
                 await writer_queue.join()
                 await writer_queue.put(None)
@@ -1164,21 +1410,39 @@ async def run() -> int:
 
             monitor_task.cancel()
             await asyncio.gather(monitor_task, return_exceptions=True)
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
+
+            for task in (join_task, stop_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(join_task, stop_task, return_exceptions=True)
+
+        # Make the DB immediately restart-clean even after Ctrl+C/fatal cancellation.
+        requeued = store.recover()
+        if requeued:
+            logger.info("Requeued %s interrupted address(es) before exit", requeued)
 
         counts = store.counts()
         elapsed = max(0.001, time.monotonic() - stats.started_monotonic)
         logger.info(
-            "Done | complete=%s queued=%s active=%s failed=%s | tx_new=%s dup=%s | "
-            "malformed=%s | requests=%s | elapsed=%.1fs",
+            "Done | complete=%s queued=%s active=%s failed=%s | tx_new=%s dup=%s "
+            "malformed=%s | requests=%s retries=%s pages=%s | elapsed=%.1fs",
             counts["done"], counts["queued"], counts["in_progress"], counts["failed"],
             stats.tx_written, stats.tx_duplicates, stats.malformed_transactions,
-            stats.requests, elapsed,
+            stats.requests, stats.request_retries, stats.pages, elapsed,
         )
-        return 2 if fatal_event.is_set() else 0
+
+        if fatal_event.is_set():
+            return 2
+        if counts["failed"]:
+            # Crawl completed as far as possible but contains permanently failed addresses.
+            return 3
+        return 0
     finally:
+        for sig in installed_signals:
+            try:
+                loop.remove_signal_handler(sig)
+            except (NotImplementedError, RuntimeError):
+                pass
         store.close()
 
 
