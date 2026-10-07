@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
-Reliable Async Etherscan BFS Crawler v17
+Reliable Async Etherscan BFS Crawler v18
 
-Key improvements over v16:
+Key improvements over v17:
+- Validates transaction hashes and required numeric fields instead of silently coercing corrupt data.
+- Detects pagination cycles using a digest of the complete page identity.
+- Enforces MAX_TXS_PER_ADDRESS across normal + internal transactions combined.
+- Preserves v17 persistent-state compatibility because the durable schema/semantics are unchanged.
 - Uses the current Etherscan Free-tier-safe default page size of 1,000.
 - Binds persistent state to crawl semantics so incompatible restarts fail closed.
 - Requeues interrupted in-progress work before exit, not only on the next launch.
@@ -68,6 +72,7 @@ SCHEMA_VERSION = "17"
 DEFAULT_BASE_URL = "https://api.etherscan.io/v2/api"
 RETRYABLE_HTTP = {408, 425, 429, 500, 502, 503, 504}
 ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
+TX_HASH_RE = re.compile(r"^0x[a-fA-F0-9]{64}$")
 
 
 # =============================================================================
@@ -290,6 +295,15 @@ def safe_int(value: Any, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError, OverflowError):
         return default
+
+
+def parse_nonnegative_int(value: Any) -> Optional[int]:
+    """Parse explorer integer fields without silently converting corruption to zero."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if parsed >= 0 else None
 
 
 def wei_to_eth_str(value: Any) -> str:
@@ -865,7 +879,7 @@ class EtherscanClient:
     async def fetch_action(self, address: str, action: str) -> FetchOutcome:
         result: list[dict[str, Any]] = []
         page = 1
-        seen_signatures: set[tuple[str, str, int]] = set()
+        seen_signatures: set[str] = set()
 
         def row_identity(row: dict[str, Any]) -> str:
             return "|".join(
@@ -907,11 +921,11 @@ class EtherscanClient:
             self.stats.api_rows += len(valid_rows)
 
             if valid_rows:
-                signature = (
-                    row_identity(valid_rows[0]),
-                    row_identity(valid_rows[-1]),
-                    len(valid_rows),
-                )
+                # Hash the complete page identity. Comparing only first/last rows can
+                # falsely flag distinct pages that happen to share boundary records.
+                signature = hashlib.sha256(
+                    "\x1e".join(row_identity(row) for row in valid_rows).encode("utf-8")
+                ).hexdigest()
                 if signature in seen_signatures:
                     return FetchOutcome(
                         ok=False,
@@ -950,7 +964,17 @@ class EtherscanClient:
             return internal
         for tx in internal.transactions:
             tx["_kind"] = "internal"
-        return FetchOutcome(ok=True, transactions=normal.transactions + internal.transactions)
+
+        combined = normal.transactions + internal.transactions
+        if CFG.max_txs_per_address and len(combined) > CFG.max_txs_per_address:
+            return FetchOutcome(
+                ok=False,
+                error=(
+                    f"MAX_TXS_PER_ADDRESS={CFG.max_txs_per_address} exceeded "
+                    "across normal + internal transactions"
+                ),
+            )
+        return FetchOutcome(ok=True, transactions=combined)
 
 
 # =============================================================================
@@ -1053,7 +1077,7 @@ def parse_transactions(
 
     for tx in rows:
         tx_hash = str(tx.get("hash", "")).strip().lower()
-        if not tx_hash:
+        if not TX_HASH_RE.fullmatch(tx_hash):
             stats.malformed_transactions += 1
             continue
 
@@ -1076,7 +1100,19 @@ def parse_transactions(
             continue
 
         kind = str(tx.get("_kind", "normal"))
+        if kind not in {"normal", "internal"}:
+            stats.malformed_transactions += 1
+            continue
+
         value_wei = str(tx.get("value", "0") or "0")
+        value_int = parse_nonnegative_int(value_wei)
+        timestamp = parse_nonnegative_int(tx.get("timeStamp"))
+        block_number = parse_nonnegative_int(tx.get("blockNumber"))
+        if value_int is None or timestamp is None or block_number is None:
+            stats.malformed_transactions += 1
+            continue
+        value_wei = str(value_int)
+
         records.append(
             Transaction(
                 record_id=transaction_record_id(tx, kind),
@@ -1085,8 +1121,8 @@ def parse_transactions(
                 to_addr=output_to,
                 value_wei=value_wei,
                 value_eth=wei_to_eth_str(value_wei),
-                timestamp=safe_int(tx.get("timeStamp")),
-                block_number=safe_int(tx.get("blockNumber")),
+                timestamp=timestamp,
+                block_number=block_number,
                 kind=kind,
                 trace_id=str(tx.get("traceId", "")),
                 is_error=str(tx.get("isError", "")),
@@ -1341,7 +1377,7 @@ async def run() -> int:
         )
         headers = {
             "Accept": "application/json",
-            "User-Agent": "etherscan-bfs-crawler/17.0",
+            "User-Agent": "etherscan-bfs-crawler/18.0",
         }
         limiter = TokenBucket(CFG.rate_limit_per_sec, CFG.burst_size)
         semaphore = asyncio.Semaphore(CFG.concurrent_requests)
