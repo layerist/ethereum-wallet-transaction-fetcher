@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Reliable Async Etherscan BFS Crawler v18
+Reliable Async Etherscan BFS Crawler v19
 
 Key improvements over v17:
 - Validates transaction hashes and required numeric fields instead of silently coercing corrupt data.
@@ -20,6 +20,14 @@ Key improvements over v17:
 - Writer keeps NDJSON as the durability authority and reconciles SQLite IDs at startup.
 - More complete metrics, including retries, pages, API rows and frontier upgrades.
 - Correct URL default (plain URL, not Markdown link syntax).
+
+Additional reliability improvements in v19:
+- Rejects malformed transaction rows instead of marking incomplete addresses done.
+- Prevents HTTP retry backoff from occupying the connection semaphore.
+- Rejects inconsistent state/output combinations instead of silently losing data.
+- Repairs interrupted final NDJSON writes while rejecting earlier corrupt records.
+- Detects unexpected worker failures and reports interrupted runs as incomplete.
+- Validates finite delay settings and HTTP Retry-After values.
 
 Required environment variables:
   ETHERSCAN_API_KEY=...
@@ -52,6 +60,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -59,8 +68,8 @@ import signal
 import sqlite3
 import time
 from dataclasses import asdict, dataclass, field
-from decimal import Decimal, InvalidOperation
 from email.utils import parsedate_to_datetime
+from datetime import timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -156,19 +165,22 @@ class Config:
             errors.append("CRAWL_DEPTH must be >= 1")
         if self.workers < 1 or self.concurrent_requests < 1:
             errors.append("CRAWL_WORKERS and CRAWL_CONCURRENT_REQUESTS must be >= 1")
-        if self.rate_limit_per_sec <= 0 or self.burst_size < 1:
+        if not math.isfinite(self.rate_limit_per_sec) or self.rate_limit_per_sec <= 0 or self.burst_size < 1:
             errors.append("rate limit must be > 0 and burst size must be >= 1")
         if self.max_request_retries < 1 or self.max_address_retries < 0:
             errors.append("retry counts are invalid")
-        if min(self.request_timeout_sec, self.connect_timeout_sec, self.sock_read_timeout_sec) <= 0:
+        if any(not math.isfinite(value) or value <= 0 for value in (
+            self.request_timeout_sec, self.connect_timeout_sec, self.sock_read_timeout_sec
+        )):
             errors.append("HTTP timeout values must be positive")
-        if self.retry_base_sec <= 0 or self.retry_cap_sec < self.retry_base_sec:
+        if (not math.isfinite(self.retry_base_sec) or not math.isfinite(self.retry_cap_sec)
+                or self.retry_base_sec <= 0 or self.retry_cap_sec < self.retry_base_sec):
             errors.append("retry delay values are invalid")
-        if self.max_retry_after_sec <= 0:
+        if not math.isfinite(self.max_retry_after_sec) or self.max_retry_after_sec <= 0:
             errors.append("MAX_RETRY_AFTER_SEC must be positive")
         if self.writer_queue_size < 1:
             errors.append("WRITER_QUEUE_SIZE must be >= 1")
-        if self.log_every_sec <= 0:
+        if not math.isfinite(self.log_every_sec) or self.log_every_sec <= 0:
             errors.append("LOG_EVERY_SEC must be positive")
         if not self.base_url.startswith(("https://", "http://")):
             errors.append("ETHERSCAN_BASE_URL must be an HTTP(S) URL")
@@ -276,6 +288,14 @@ class FrontierLimitError(RuntimeError):
     pass
 
 
+class SafetyLimitError(RuntimeError):
+    """A configured crawl bound was reached; allow recovery after raising it."""
+
+
+class MalformedTransactionError(ValueError):
+    """Explorer returned a transaction that cannot safely be written or traversed."""
+
+
 # =============================================================================
 # UTILITIES
 # =============================================================================
@@ -298,22 +318,28 @@ def safe_int(value: Any, default: int = 0) -> int:
 
 
 def parse_nonnegative_int(value: Any) -> Optional[int]:
-    """Parse explorer integer fields without silently converting corruption to zero."""
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError, OverflowError):
+    """Require an unsigned base-10 integer, not a truncated float or a bool."""
+    if isinstance(value, bool):
         return None
-    return parsed if parsed >= 0 else None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str) and value.isascii() and value.isdecimal():
+        try:
+            return int(value)
+        except ValueError:  # Includes Python's configured digit-length limit.
+            return None
+    return None
 
 
 def wei_to_eth_str(value: Any) -> str:
-    try:
-        wei = Decimal(str(value or "0"))
-        if not wei.is_finite():
-            return "0"
-        return format(wei / Decimal("1000000000000000000"), "f")
-    except (InvalidOperation, ValueError, TypeError):
+    """Convert wei exactly: Decimal's default precision can round large balances."""
+    wei = parse_nonnegative_int(value)
+    if wei is None:
         return "0"
+    whole, fraction = divmod(wei, 10**18)
+    if fraction == 0:
+        return str(whole)
+    return f"{whole}.{fraction:018d}".rstrip("0")
 
 
 def transaction_record_id(tx: dict[str, Any], kind: str) -> str:
@@ -343,27 +369,31 @@ def full_jitter_delay(attempt: int, base: float, cap: float) -> float:
 def parse_retry_after(value: Optional[str], cap: float) -> Optional[float]:
     if not value:
         return None
-    delay: Optional[float]
     try:
-        delay = max(0.0, float(value))
+        delay = float(value)
+        if not math.isfinite(delay):
+            return None
+        return min(cap, max(0.0, delay))
     except ValueError:
         try:
             retry_at = parsedate_to_datetime(value)
-            delay = max(0.0, retry_at.timestamp() - time.time())
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=timezone.utc)
+            return min(cap, max(0.0, retry_at.timestamp() - time.time()))
         except (TypeError, ValueError, OverflowError):
             return None
-    return min(cap, delay)
 
 
 def is_no_transactions(data: dict[str, Any]) -> bool:
     result = data.get("result")
-    message = str(data.get("message", "")).lower()
-    result_text = str(result).lower()
-    return (
-        result == []
-        or "no transactions found" in message
-        or "no transactions found" in result_text
-    )
+    status = str(data.get("status", ""))
+    message = str(data.get("message", "")).strip().lower()
+    result_text = result.strip().lower() if isinstance(result, str) else ""
+    if status == "0":
+        # A NOTOK response with an empty list is still an API error unless it
+        # explicitly reports no transactions; otherwise rows could be lost.
+        return "no transactions found" in {message, result_text}
+    return result == []
 
 
 def api_error_text(data: dict[str, Any]) -> str:
@@ -704,6 +734,22 @@ class StateStore:
             self.conn.execute("ROLLBACK")
             raise
 
+    def assert_output_consistent(self, output_ids: set[str]) -> None:
+        """NDJSON is authoritative: never resume with durable IDs missing from it."""
+        missing = self.conn.execute("SELECT COUNT(*) FROM transaction_ids").fetchone()[0]
+        if missing > len(output_ids):
+            raise RuntimeError(
+                "STATE_DB contains transaction IDs absent from OUTPUT_FILE. "
+                "Restore the original output or use RESET_STATE=true."
+            )
+        if missing:
+            for (record_id,) in self.conn.execute("SELECT record_id FROM transaction_ids"):
+                if record_id not in output_ids:
+                    raise RuntimeError(
+                        "STATE_DB contains transaction IDs absent from OUTPUT_FILE. "
+                        "Restore the original output or use RESET_STATE=true."
+                    )
+
     def insert_transaction_ids(self, ids: Iterable[str]) -> int:
         now = int(time.time())
         inserted = 0
@@ -763,112 +809,72 @@ class EtherscanClient:
     async def _request(self, params: dict[str, Any]) -> Optional[dict[str, Any]]:
         last_error = "request failed"
         for attempt in range(CFG.max_request_retries):
-            if self.stop_event.is_set():
+            if self.stop_event.is_set() or not await self.limiter.acquire(self.stop_event):
                 return None
-            if not await self.limiter.acquire(self.stop_event):
-                return None
-
             if attempt:
                 self.stats.request_retries += 1
 
+            retry_delay: Optional[float] = None
             try:
+                # Backoff happens after leaving this semaphore: a throttled request
+                # must not keep other workers from using the available connections.
                 async with self.semaphore:
                     async with self.session.get(CFG.base_url, params=params) as response:
                         self.stats.requests += 1
                         status = response.status
-                        body = await response.text()
-
                         if status in RETRYABLE_HTTP:
                             self.stats.http_errors += 1
                             last_error = f"HTTP {status}"
-                            if attempt + 1 >= CFG.max_request_retries:
-                                break
-                            delay = parse_retry_after(
+                            retry_delay = parse_retry_after(
                                 response.headers.get("Retry-After"), CFG.max_retry_after_sec
                             )
-                            if delay is None:
-                                delay = full_jitter_delay(
-                                    attempt, CFG.retry_base_sec, CFG.retry_cap_sec
-                                )
-                            if not await self._sleep_or_stop(delay):
-                                return None
-                            continue
-
-                        if status in {401, 403}:
+                        elif status in {401, 403}:
+                            body = await response.text()
                             raise FatalAPIError(f"HTTP {status}: {body[:500]}")
-
-                        if status != 200:
+                        elif status != 200:
                             self.stats.http_errors += 1
+                            body = await response.text()
                             last_error = f"HTTP {status}: {body[:300]}"
-                            # Other 4xx responses are permanent for the exact request.
                             if 400 <= status < 500:
                                 raise FatalAPIError(last_error)
-                            if attempt + 1 >= CFG.max_request_retries:
-                                break
-                            if not await self._sleep_or_stop(
-                                full_jitter_delay(attempt, CFG.retry_base_sec, CFG.retry_cap_sec)
-                            ):
-                                return None
-                            continue
-
-                        try:
-                            data = json.loads(body)
-                        except json.JSONDecodeError as exc:
-                            self.stats.http_errors += 1
-                            last_error = f"invalid JSON: {exc}"
-                            if attempt + 1 >= CFG.max_request_retries:
-                                break
-                            if not await self._sleep_or_stop(
-                                full_jitter_delay(attempt, CFG.retry_base_sec, CFG.retry_cap_sec)
-                            ):
-                                return None
-                            continue
-
-                        if not isinstance(data, dict):
-                            self.stats.http_errors += 1
-                            last_error = f"unexpected JSON root type: {type(data).__name__}"
-                            if attempt + 1 >= CFG.max_request_retries:
-                                break
-                            if not await self._sleep_or_stop(
-                                full_jitter_delay(attempt, CFG.retry_base_sec, CFG.retry_cap_sec)
-                            ):
-                                return None
-                            continue
-
-                        status_value = str(data.get("status", ""))
-                        if status_value == "0" and not is_no_transactions(data):
-                            classification = classify_api_error(data)
-                            text = api_error_text(data) or "unknown Etherscan API error"
-                            if classification == "fatal":
-                                raise FatalAPIError(text)
-                            if classification == "retryable":
-                                self.stats.soft_errors += 1
-                                last_error = text
-                                if attempt + 1 >= CFG.max_request_retries:
-                                    break
-                                if not await self._sleep_or_stop(
-                                    full_jitter_delay(
-                                        attempt, CFG.retry_base_sec, CFG.retry_cap_sec
+                        else:
+                            try:
+                                data = await response.json(content_type=None)
+                            except (aiohttp.ContentTypeError, ValueError) as exc:
+                                self.stats.http_errors += 1
+                                last_error = f"invalid JSON: {exc}"
+                            else:
+                                if not isinstance(data, dict):
+                                    self.stats.http_errors += 1
+                                    last_error = (
+                                        f"unexpected JSON root type: {type(data).__name__}"
                                     )
-                                ):
-                                    return None
-                                continue
-                            # Unknown NOTOK is not safe to reinterpret as a valid empty result.
-                            raise FatalAPIError(f"Non-retryable Etherscan API error: {text}")
-
-                        return data
-
+                                elif str(data.get("status", "")) == "0" and not is_no_transactions(data):
+                                    classification = classify_api_error(data)
+                                    message = api_error_text(data) or "unknown Etherscan API error"
+                                    if classification == "fatal":
+                                        raise FatalAPIError(message)
+                                    if classification != "retryable":
+                                        raise FatalAPIError(
+                                            f"Non-retryable Etherscan API error: {message}"
+                                        )
+                                    self.stats.soft_errors += 1
+                                    last_error = message
+                                else:
+                                    return data
             except FatalAPIError:
                 raise
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 self.stats.http_errors += 1
                 last_error = repr(exc)
-                if attempt + 1 >= CFG.max_request_retries:
-                    break
-                if not await self._sleep_or_stop(
-                    full_jitter_delay(attempt, CFG.retry_base_sec, CFG.retry_cap_sec)
-                ):
-                    return None
+
+            if attempt + 1 >= CFG.max_request_retries:
+                break
+            delay = retry_delay if retry_delay is not None else full_jitter_delay(
+                attempt, CFG.retry_base_sec, CFG.retry_cap_sec
+            )
+            if not await self._sleep_or_stop(delay):
+                return None
 
         logger.debug(
             "Request exhausted retries action=%s address=%s: %s",
@@ -881,21 +887,9 @@ class EtherscanClient:
         page = 1
         seen_signatures: set[str] = set()
 
-        def row_identity(row: dict[str, Any]) -> str:
-            return "|".join(
-                str(row.get(key, ""))
-                for key in (
-                    "hash", "traceId", "blockNumber", "transactionIndex", "from", "to",
-                    "contractAddress", "value", "type", "callType",
-                )
-            )
-
         while not self.stop_event.is_set():
             if CFG.max_pages_per_address and page > CFG.max_pages_per_address:
-                return FetchOutcome(
-                    ok=False,
-                    error=f"MAX_PAGES_PER_ADDRESS exceeded for {action}",
-                )
+                raise SafetyLimitError(f"MAX_PAGES_PER_ADDRESS exceeded for {action}")
 
             data = await self._request(build_params(address, action, page))
             if data is None:
@@ -924,7 +918,8 @@ class EtherscanClient:
                 # Hash the complete page identity. Comparing only first/last rows can
                 # falsely flag distinct pages that happen to share boundary records.
                 signature = hashlib.sha256(
-                    "\x1e".join(row_identity(row) for row in valid_rows).encode("utf-8")
+                    json.dumps(valid_rows, sort_keys=True, ensure_ascii=False,
+                               separators=(",", ":")).encode("utf-8")
                 ).hexdigest()
                 if signature in seen_signatures:
                     return FetchOutcome(
@@ -934,12 +929,8 @@ class EtherscanClient:
                 seen_signatures.add(signature)
 
             if CFG.max_txs_per_address and len(result) + len(valid_rows) > CFG.max_txs_per_address:
-                return FetchOutcome(
-                    ok=False,
-                    error=(
-                        f"MAX_TXS_PER_ADDRESS={CFG.max_txs_per_address} exceeded "
-                        f"for {action}"
-                    ),
+                raise SafetyLimitError(
+                    f"MAX_TXS_PER_ADDRESS={CFG.max_txs_per_address} exceeded for {action}"
                 )
 
             result.extend(valid_rows)
@@ -967,12 +958,9 @@ class EtherscanClient:
 
         combined = normal.transactions + internal.transactions
         if CFG.max_txs_per_address and len(combined) > CFG.max_txs_per_address:
-            return FetchOutcome(
-                ok=False,
-                error=(
-                    f"MAX_TXS_PER_ADDRESS={CFG.max_txs_per_address} exceeded "
-                    "across normal + internal transactions"
-                ),
+            raise SafetyLimitError(
+                f"MAX_TXS_PER_ADDRESS={CFG.max_txs_per_address} exceeded "
+                "across normal + internal transactions"
             )
         return FetchOutcome(ok=True, transactions=combined)
 
@@ -988,24 +976,48 @@ async def load_output_ids(path: Path) -> set[str]:
         return ids
 
     logger.info("Scanning existing output for restart dedupe: %s", path)
-    line_no = 0
-    async with aiofiles.open(path, "r", encoding="utf-8") as file:
+    async with aiofiles.open(path, "rb+") as file:
+        offset = 0
+        line_no = 0
         async for line in file:
             line_no += 1
+            end_offset = offset + len(line)
             if not line.strip():
+                offset = end_offset
                 continue
             try:
                 row = json.loads(line)
                 if not isinstance(row, dict):
-                    continue
+                    raise ValueError("expected a JSON object")
                 record_id = row.get("record_id")
-                if record_id:
-                    ids.add(str(record_id))
-                elif row.get("hash"):
+                if isinstance(record_id, str) and record_id:
+                    ids.add(record_id)
+                elif isinstance(row.get("hash"), str) and TX_HASH_RE.fullmatch(row["hash"]):
                     # Compatibility with old normal-transaction-only output.
-                    ids.add(f"normal:{str(row['hash']).lower()}")
-            except (json.JSONDecodeError, AttributeError, TypeError):
-                logger.warning("Ignoring malformed existing NDJSON line %s", line_no)
+                    ids.add(f"normal:{row['hash'].lower()}")
+                else:
+                    raise ValueError("missing transaction record ID")
+            except (json.JSONDecodeError, UnicodeDecodeError, ValueError, TypeError) as exc:
+                # An interrupted append can leave a non-terminated, invalid final
+                # line. Only that tail is safe to discard; earlier damage is fatal.
+                if not line.endswith(b"\n") and await file.tell() == (await file.seek(0, 2)):
+                    await file.truncate(offset)
+                    await file.flush()
+                    if CFG.fsync_writes:
+                        await asyncio.to_thread(os.fsync, file.fileno())
+                    logger.warning("Discarded interrupted trailing NDJSON line %s: %s", line_no, exc)
+                    break
+                raise RuntimeError(f"Corrupt OUTPUT_FILE line {line_no}: {exc}") from exc
+            if not line.endswith(b"\n"):
+                # Valid but non-terminated record: append the missing delimiter.
+                await file.seek(end_offset)
+                await file.write(b"\n")
+                await file.flush()
+                if CFG.fsync_writes:
+                    await asyncio.to_thread(os.fsync, file.fileno())
+                logger.warning("Restored missing newline in final output record")
+                break
+            offset = end_offset
     logger.info("Loaded %s output record IDs", len(ids))
     return ids
 
@@ -1075,50 +1087,46 @@ def parse_transactions(
     records: list[Transaction] = []
     neighbors: set[str] = set()
 
-    for tx in rows:
+    def malformed(index: int, reason: str) -> None:
+        stats.malformed_transactions += 1
+        raise MalformedTransactionError(f"Invalid transaction at API row {index}: {reason}")
+
+    for index, tx in enumerate(rows, start=1):
         tx_hash = str(tx.get("hash", "")).strip().lower()
         if not TX_HASH_RE.fullmatch(tx_hash):
-            stats.malformed_transactions += 1
-            continue
+            malformed(index, "invalid transaction hash")
 
         from_addr = normalize_address(tx.get("from"))
         raw_to = tx.get("to")
         to_addr = normalize_address(raw_to)
-        contract_address = normalize_address(tx.get("contractAddress"))
-
+        raw_contract = tx.get("contractAddress")
+        contract_address = normalize_address(raw_contract)
         if not from_addr:
-            stats.malformed_transactions += 1
-            continue
-
+            malformed(index, "invalid sender address")
         # Empty `to` is legitimate for contract creation.
         if raw_to not in (None, "") and not to_addr:
-            stats.malformed_transactions += 1
-            continue
+            malformed(index, "invalid recipient address")
+        if raw_contract not in (None, "") and not contract_address:
+            malformed(index, "invalid contract address")
 
-        output_to = to_addr or contract_address or ""
-        if CFG.skip_self_transfers and to_addr and from_addr == to_addr:
-            continue
-
-        kind = str(tx.get("_kind", "normal"))
+        kind = tx.get("_kind", "normal")
         if kind not in {"normal", "internal"}:
-            stats.malformed_transactions += 1
-            continue
-
-        value_wei = str(tx.get("value", "0") or "0")
-        value_int = parse_nonnegative_int(value_wei)
+            malformed(index, "invalid transaction kind")
+        value_int = parse_nonnegative_int(tx.get("value"))
         timestamp = parse_nonnegative_int(tx.get("timeStamp"))
         block_number = parse_nonnegative_int(tx.get("blockNumber"))
         if value_int is None or timestamp is None or block_number is None:
-            stats.malformed_transactions += 1
+            malformed(index, "invalid numeric field")
+        if CFG.skip_self_transfers and to_addr and from_addr == to_addr:
             continue
-        value_wei = str(value_int)
 
+        value_wei = str(value_int)
         records.append(
             Transaction(
                 record_id=transaction_record_id(tx, kind),
                 hash=tx_hash,
                 from_addr=from_addr,
-                to_addr=output_to,
+                to_addr=to_addr or contract_address or "",
                 value_wei=value_wei,
                 value_eth=wei_to_eth_str(value_wei),
                 timestamp=timestamp,
@@ -1128,7 +1136,6 @@ def parse_transactions(
                 is_error=str(tx.get("isError", "")),
             )
         )
-
         neighbors.add(from_addr)
         if to_addr:
             neighbors.add(to_addr)
@@ -1182,6 +1189,9 @@ async def worker_loop(
 
             outcome = await client.fetch_transactions(item.address)
             if not outcome.ok:
+                if stop_event.is_set():
+                    # Shutdown is not an address failure; recover() will requeue.
+                    continue
                 retry_item = store.mark_retry_or_failed(item, outcome.error)
                 if retry_item is not None and not stop_event.is_set():
                     stats.address_retries += 1
@@ -1220,14 +1230,12 @@ async def worker_loop(
 
         except FatalAPIError as exc:
             logger.error("Fatal Etherscan API error: %s", exc)
-            if claimed is not None:
-                store.mark_retry_or_failed(item, str(exc))
+            # Leave in_progress for recover() so fixing a key or configuration
+            # permits a restart without permanently failing this address.
             fatal_event.set()
             stop_event.set()
-        except FrontierLimitError as exc:
-            logger.error("Frontier safety limit reached: %s", exc)
-            if claimed is not None:
-                store.mark_retry_or_failed(item, str(exc))
+        except (FrontierLimitError, SafetyLimitError) as exc:
+            logger.error("Crawl safety limit reached: %s", exc)
             fatal_event.set()
             stop_event.set()
         except asyncio.CancelledError:
@@ -1342,6 +1350,12 @@ async def run() -> int:
             logger.warning("Recovered %s interrupted in-progress address(es)", recovered)
 
         store.enqueue(start, CFG.depth)
+        output_ids = await load_output_ids(CFG.output_file)
+        store.assert_output_consistent(output_ids)
+        repaired = store.insert_transaction_ids(output_ids)
+        if repaired:
+            logger.info("Reconciled %s transaction IDs into SQLite", repaired)
+
         queued = store.queued_items()
         if not queued:
             counts = store.counts()
@@ -1349,7 +1363,7 @@ async def run() -> int:
                 "No queued addresses. Existing state: done=%s failed=%s",
                 counts["done"], counts["failed"],
             )
-            return 0
+            return 3 if counts["failed"] else 0
 
         work_queue: asyncio.Queue[WorkItem] = asyncio.Queue()
         writer_queue: asyncio.Queue[Optional[WriteRequest]] = asyncio.Queue(
@@ -1357,11 +1371,6 @@ async def run() -> int:
         )
         for item in queued:
             work_queue.put_nowait(item)
-
-        output_ids = await load_output_ids(CFG.output_file)
-        repaired = store.insert_transaction_ids(output_ids)
-        if repaired:
-            logger.info("Reconciled %s transaction IDs into SQLite", repaired)
 
         timeout = aiohttp.ClientTimeout(
             total=CFG.request_timeout_sec,
@@ -1377,7 +1386,7 @@ async def run() -> int:
         )
         headers = {
             "Accept": "application/json",
-            "User-Agent": "etherscan-bfs-crawler/18.0",
+            "User-Agent": "etherscan-bfs-crawler/19.0",
         }
         limiter = TokenBucket(CFG.rate_limit_per_sec, CFG.burst_size)
         semaphore = asyncio.Semaphore(CFG.concurrent_requests)
@@ -1411,9 +1420,21 @@ async def run() -> int:
             stop_task = asyncio.create_task(stop_event.wait(), name="stop-wait")
 
             done, _ = await asyncio.wait(
-                {join_task, stop_task, writer_task},
+                {join_task, stop_task, writer_task, *workers},
                 return_when=asyncio.FIRST_COMPLETED,
             )
+
+            unexpected_workers = [worker for worker in workers if worker in done]
+            if unexpected_workers:
+                for worker in unexpected_workers:
+                    if worker.cancelled():
+                        logger.error("Worker %s was unexpectedly cancelled", worker.get_name())
+                    elif worker.exception() is not None:
+                        logger.error("Worker %s crashed: %r", worker.get_name(), worker.exception())
+                    else:
+                        logger.error("Worker %s exited unexpectedly", worker.get_name())
+                fatal_event.set()
+                stop_event.set()
 
             normal_drain = join_task in done and not stop_event.is_set()
 
@@ -1469,6 +1490,8 @@ async def run() -> int:
 
         if fatal_event.is_set():
             return 2
+        if not normal_drain:
+            return 130
         if counts["failed"]:
             # Crawl completed as far as possible but contains permanently failed addresses.
             return 3
